@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>High-Precision GPS Logger</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; line-height: 1.6; }
+    .btn { padding: 12px 24px; font-size: 16px; margin-right: 10px; border-radius: 6px; border: none; cursor: pointer; }
+    .start { background-color: #007bff; color: white; }
+    .stop { background-color: #dc3545; color: white; }
+    .download { background-color: #28a745; color: white; }
+    #status { margin: 15px 0; font-weight: bold; }
+    #log { background: #f4f4f4; padding: 10px; border-radius: 4px; font-family: monospace; max-height: 200px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <h2>GPS Data Logger</h2>
+  <div>
+    <button id="btnStart" class="btn start">START</button>
+    <button id="btnStop" class="btn stop" disabled>STOP</button>
+    <button id="btnDownload" class="btn download" disabled>CSV Download</button>
+  </div>
+  <div id="status">Status: Ready</div>
+  <pre id="log"></pre>
+
+  <script>
+    let watchId = null;
+    let wakeLock = null;
+    const records = [["timestamp", "lat", "lng", "accuracy", "speed", "altitude"]];
+
+    const btnStart = document.getElementById('btnStart');
+    const btnStop = document.getElementById('btnStop');
+    const btnDownload = document.getElementById('btnDownload');
+    const statusDiv = document.getElementById('status');
+    const logPre = document.getElementById('log');
+
+    // 画面スリープ防止
+    async function requestWakeLock() {
+      if ('wakeLock' in navigator) {
+        try { wakeLock = await navigator.wakeLock.request('screen'); }
+        catch (err) { console.warn('Wake Lock error:', err); }
+      }
+    }
+
+    btnStart.addEventListener('click', async () => {
+      if (!navigator.geolocation) {
+        alert("Geolocation is not supported by your browser.");
+        return;
+      }
+      await requestWakeLock();
+
+      const options = {
+        enableHighAccuracy: true,
+        timeout: 5000,
+        maximumAge: 0
+      };
+
+      watchId = navigator.geolocation.watchPosition(
+        (pos) => {
+          const t = Date.now();
+          const lat = pos.coords.latitude.toFixed(6);
+          const lng = pos.coords.longitude.toFixed(6);
+          const acc = pos.coords.accuracy ? pos.coords.accuracy.toFixed(2) : "";
+          const spd = pos.coords.speed !== null ? pos.coords.speed.toFixed(2) : "";
+          const alt = pos.coords.altitude !== null ? pos.coords.altitude.toFixed(2) : "";
+
+          records.push([t, lat, lng, acc, spd, alt]);
+          statusDiv.innerText = `Logging: ${records.length - 1} pts | Acc: ${acc}m | Spd: ${spd}m/s`;
+          logPre.innerText = `${t},${lat},${lng},${acc},${spd},${alt}\n` + logPre.innerText;
+        },
+        (err) => {
+          statusDiv.innerText = `Error: ${err.message} (Code: ${err.code})`;
+        },
+        options
+      );
+
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+      btnDownload.disabled = true;
+      statusDiv.innerText = "Status: Logging started...";
+    });
+
+    btnStop.addEventListener('click', () => {
+      if (watchId !== null) {
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+      }
+      if (wakeLock) {
+        wakeLock.release().then(() => { wakeLock = null; });
+      }
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      btnDownload.disabled = records.length <= 1;
+      statusDiv.innerText = `Status: Stopped. Total points: ${records.length - 1}`;
+    });
+
+    btnDownload.addEventListener('click', () => {
+      const csvContent = records.map(e => e.join(",")).join("\n");
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `gps_log_${Date.now()}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  </script>
+</body>
+</html>
