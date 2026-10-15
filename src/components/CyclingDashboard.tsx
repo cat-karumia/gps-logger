@@ -16,7 +16,10 @@ import {
   History,
   Image as ImageIcon,
   FileText,
-  Bike
+  Edit2,
+  Check,
+  ChevronDown,
+  ChevronUp
 } from "lucide-react";
 
 interface BumpPoint {
@@ -35,7 +38,7 @@ interface RideSession {
   spotName: string;
   bikeType: string;
   startTime: number;
-  route: { lat: number; lng: number }[];
+  route: { lat: number; lng: number; time: number }[];
   bumps: BumpPoint[];
   distanceKm: number;
 }
@@ -62,23 +65,31 @@ export default function CyclingDashboard() {
   const [allSessions, setAllSessions] = useState<RideSession[]>([]);
   const [nearbyBump, setNearbyBump] = useState<BumpPoint | null>(null);
 
+  // セッション編集状態
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
+  const [editingSessionTitle, setEditingSessionTitle] = useState("");
+  const [expandedSessionId, setExpandedSessionId] = useState<string | null>(null);
+
   // 設定
   const [thresholdG, setThresholdG] = useState(2.2);
   const [showSettings, setShowSettings] = useState(false);
 
-  // 撮影
+  // 撮影ターゲット
   const [targetBump, setTargetBump] = useState<BumpPoint | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // 地図
+  // 地図DOM保持
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
   const layerGroupRef = useRef<any>(null);
 
+  // バックグラウンドでも永続するRef
   const watchIdRef = useRef<number | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const currentPosRef = useRef<{ lat: number; lng: number }>({ lat: 35.6600, lng: 139.3900 });
   const lastDetectionTimeRef = useRef<number>(0);
+  const allBumpsRef = useRef<BumpPoint[]>([]);
+  allBumpsRef.current = allBumps;
 
   const formatDateTimeId = (ts: number) => {
     const d = new Date(ts);
@@ -86,6 +97,7 @@ export default function CyclingDashboard() {
     return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
   };
 
+  // 1. ローカルストレージ復元
   useEffect(() => {
     const savedBumps = localStorage.getItem("velo_accumulated_bumps");
     if (savedBumps) {
@@ -102,14 +114,12 @@ export default function CyclingDashboard() {
     localStorage.setItem("velo_accumulated_bumps", JSON.stringify(bumps));
   };
 
-  const deleteBump = (id: string) => {
-    const updated = allBumps.filter((b) => b.id !== id);
-    saveBumps(updated);
-    if (nearbyBump?.id === id) setNearbyBump(null);
-    if (mapRef.current) mapRef.current.closePopup();
+  const saveSessions = (sessions: RideSession[]) => {
+    setAllSessions(sessions);
+    localStorage.setItem("velo_sessions_history", JSON.stringify(sessions));
   };
 
-  // 加速度センサー監視
+  // 2. 加速度センサー（タブ切り替えに影響されず常時監視）
   useEffect(() => {
     if (!isRecording) return;
 
@@ -133,7 +143,7 @@ export default function CyclingDashboard() {
           timestamp: now,
         };
 
-        saveBumps([newBump, ...allBumps]);
+        saveBumps([newBump, ...allBumpsRef.current]);
 
         const flash = document.createElement("div");
         flash.className = "fixed inset-0 bg-amber-400/40 z-50 pointer-events-none transition-opacity duration-300";
@@ -147,9 +157,56 @@ export default function CyclingDashboard() {
 
     window.addEventListener("devicemotion", handleMotion);
     return () => window.removeEventListener("devicemotion", handleMotion);
-  }, [isRecording, thresholdG, allBumps]);
+  }, [isRecording, thresholdG]);
 
-  // 地図初期化（APIキー不要のOpenStreetMapに修正）
+  // 3. GPS位置情報追従（タブ切り替えで絶対に途切れない分離構成）
+  useEffect(() => {
+    if (!isRecording || !navigator.geolocation) return;
+
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        const spd = pos.coords.speed ? Math.max(0, pos.coords.speed * 3.6) : 0;
+        setCurrentSpeed(spd);
+        const p = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        currentPosRef.current = p;
+
+        if (mapRef.current) {
+          mapRef.current.panTo([p.lat, p.lng], { animate: true });
+        }
+
+        // 未撮影段差への近接判定 (35m以内)
+        const unphotographed = allBumpsRef.current.filter((b) => !b.photoUrl);
+        let found: BumpPoint | null = null;
+        for (const b of unphotographed) {
+          const R = 6371e3;
+          const φ1 = (p.lat * Math.PI) / 180;
+          const φ2 = (b.lat * Math.PI) / 180;
+          const Δφ = ((b.lat - p.lat) * Math.PI) / 180;
+          const Δλ = ((b.lng - p.lng) * Math.PI) / 180;
+          const a = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
+          const d = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+          if (d <= 35) {
+            found = b;
+            break;
+          }
+        }
+        setNearbyBump(found);
+
+        setCurrentRoute((prev) => [...prev, { ...p, time: pos.timestamp }]);
+      },
+      (err) => console.error("GPS Watch Error:", err),
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+
+    return () => {
+      if (watchIdRef.current) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+    };
+  }, [isRecording]);
+
+  // 4. 地図インスタンス初期化（DOM非破棄型・OpenStreetMap）
   useEffect(() => {
     const initMap = () => {
       if (!mapContainerRef.current || mapRef.current) return;
@@ -161,7 +218,6 @@ export default function CyclingDashboard() {
         attributionControl: false,
       }).setView([currentPosRef.current.lat, currentPosRef.current.lng], 16);
 
-      // OpenStreetMap 標準タイル (登録・APIキー不要)
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
         maxZoom: 19,
       }).addTo(map);
@@ -179,8 +235,19 @@ export default function CyclingDashboard() {
     } else {
       initMap();
     }
+  }, []);
+
+  // タブが live に戻った時にサイズ同期
+  useEffect(() => {
+    if (activeView === "live" && mapRef.current) {
+      setTimeout(() => {
+        mapRef.current.invalidateSize();
+      }, 100);
+      drawMap();
+    }
   }, [activeView]);
 
+  // 地図描画
   const drawMap = () => {
     if (!mapRef.current || !layerGroupRef.current) return;
     const L = (window as any).L;
@@ -208,7 +275,7 @@ export default function CyclingDashboard() {
 
       const statusBadge = hasPhoto
         ? `<span style="color:#059669; font-weight:bold;">✅ 検知 (保存済み)</span>`
-        : `<span style="color:#d97706; font-weight:bold;">⚠️ 未撮影 (引き返し/再走で撮影)</span>`;
+        : `<span style="color:#d97706; font-weight:bold;">⚠️ 未撮影 (折り返し/再走で撮影)</span>`;
 
       const popupHtml = `
         <div style="color:#0f172a; font-size:12px; min-width:190px;">
@@ -236,10 +303,7 @@ export default function CyclingDashboard() {
       marker.on("popupopen", () => {
         const btnPhoto = document.getElementById(`btn_photo_${bump.id}`);
         if (btnPhoto) {
-          btnPhoto.onclick = () => {
-            setTargetBump(bump);
-            fileInputRef.current?.click();
-          };
+          btnPhoto.onclick = () => triggerCameraForBump(bump);
         }
         const btnDel = document.getElementById(`btn_del_${bump.id}`);
         if (btnDel) {
@@ -259,50 +323,56 @@ export default function CyclingDashboard() {
 
   useEffect(() => {
     drawMap();
-  }, [allBumps, currentRoute, activeView]);
+  }, [allBumps, currentRoute]);
 
-  // GPS追従
-  useEffect(() => {
-    if (!isRecording || !navigator.geolocation) return;
+  // 5. 写真撮影トリガー
+  const triggerCameraForBump = (bump: BumpPoint) => {
+    setTargetBump(bump);
+    fileInputRef.current?.click();
+  };
 
-    watchIdRef.current = navigator.geolocation.watchPosition(
-      (pos) => {
-        const spd = pos.coords.speed ? Math.max(0, pos.coords.speed * 3.6) : 0;
-        setCurrentSpeed(spd);
-        const p = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-        currentPosRef.current = p;
+  // 即時段差撮影（目の前にある未撮影段差、または今この場所を登録）
+  const triggerQuickCapture = () => {
+    if (nearbyBump) {
+      triggerCameraForBump(nearbyBump);
+      return;
+    }
+    // 直近50m以内の最も近い未撮影段差を探す
+    const unphotographed = allBumps.filter((b) => !b.photoUrl);
+    let closest: BumpPoint | null = null;
+    let minDist = 50;
 
-        if (mapRef.current) mapRef.current.panTo([p.lat, p.lng], { animate: true });
+    for (const b of unphotographed) {
+      const R = 6371e3;
+      const φ1 = (currentPosRef.current.lat * Math.PI) / 180;
+      const φ2 = (b.lat * Math.PI) / 180;
+      const Δφ = ((b.lat - currentPosRef.current.lat) * Math.PI) / 180;
+      const Δλ = ((b.lng - currentPosRef.current.lng) * Math.PI) / 180;
+      const a = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
+      const d = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      if (d < minDist) {
+        minDist = d;
+        closest = b;
+      }
+    }
 
-        const unphotographed = allBumps.filter((b) => !b.photoUrl);
-        let found: BumpPoint | null = null;
-        for (const b of unphotographed) {
-          const R = 6371e3;
-          const φ1 = (p.lat * Math.PI) / 180;
-          const φ2 = (b.lat * Math.PI) / 180;
-          const Δφ = ((b.lat - p.lat) * Math.PI) / 180;
-          const Δλ = ((b.lng - p.lng) * Math.PI) / 180;
-          const a = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
-          const d = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-          if (d <= 35) {
-            found = b;
-            break;
-          }
-        }
-        setNearbyBump(found);
+    if (closest) {
+      triggerCameraForBump(closest);
+    } else {
+      // 近くに検知ログがなければ、その場の座標で即席作成して撮影
+      const now = Date.now();
+      const newBump: BumpPoint = {
+        id: `BUMP_${formatDateTimeId(now)}`,
+        lat: currentPosRef.current.lat,
+        lng: currentPosRef.current.lng,
+        impactG: currentG,
+        timestamp: now,
+      };
+      saveBumps([newBump, ...allBumps]);
+      triggerCameraForBump(newBump);
+    }
+  };
 
-        setCurrentRoute((prev) => [...prev, { ...p, time: pos.timestamp }]);
-      },
-      (err) => console.error(err),
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-    );
-
-    return () => {
-      if (watchIdRef.current) navigator.geolocation.clearWatch(watchIdRef.current);
-    };
-  }, [isRecording, allBumps]);
-
-  // 写真保存
   const handlePhotoCapture = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !targetBump) return;
@@ -313,6 +383,7 @@ export default function CyclingDashboard() {
       const dateStr = formatDateTimeId(targetBump.timestamp);
       const fileName = `IMG_${dateStr}_${targetBump.impactG.toFixed(2)}G_${targetBump.lat.toFixed(5)}_${targetBump.lng.toFixed(5)}.jpg`;
 
+      // 端末へダウンロード保存
       const a = document.createElement("a");
       a.href = dataUrl;
       a.download = fileName;
@@ -329,34 +400,49 @@ export default function CyclingDashboard() {
     reader.readAsDataURL(file);
   };
 
-  // CSVエクスポート
-  const exportAllCSV = () => {
-    const dateStr = formatDateTimeId(Date.now());
-
-    if (currentRoute.length > 0) {
-      const routeHeader = "timestamp,iso_time,lat,lng\n";
-      const routeBody = currentRoute
-        .map((r) => `${r.time},${new Date(r.time).toISOString()},${r.lat},${r.lng}`)
-        .join("\n");
-      const blobRoute = new Blob([routeHeader + routeBody], { type: "text/csv;charset=utf-8;" });
-      const a1 = document.createElement("a");
-      a1.href = URL.createObjectURL(blobRoute);
-      a1.download = `LOG_${dateStr}_TRACK.csv`;
-      a1.click();
-    }
-
-    const bumpHeader = "id,timestamp,iso_time,lat,lng,impact_g,status,photo_filename\n";
-    const bumpBody = allBumps
-      .map((b) => `${b.id},${b.timestamp},${new Date(b.timestamp).toISOString()},${b.lat},${b.lng},${b.impactG.toFixed(3)},${b.photoUrl ? "SAVED" : "UNPHOTOGRAPHED"},${b.photoFileName || "NONE"}`)
-      .join("\n");
-    const blobBump = new Blob([bumpHeader + bumpBody], { type: "text/csv;charset=utf-8;" });
-    const a2 = document.createElement("a");
-    a2.href = URL.createObjectURL(blobBump);
-    a2.download = `BUMPS_MASTER_${dateStr}.csv`;
-    a2.click();
+  const deleteBump = (id: string) => {
+    const updated = allBumps.filter((b) => b.id !== id);
+    saveBumps(updated);
+    if (nearbyBump?.id === id) setNearbyBump(null);
+    if (mapRef.current) mapRef.current.closePopup();
   };
 
-  // 計測開始/停止（停止時にセッションとして蓄積）
+  // 6. セッション操作（ダウンロード・リネーム・削除）
+  const downloadSessionCSV = (sess: RideSession) => {
+    const routeHeader = "timestamp,iso_time,lat,lng\n";
+    const routeBody = sess.route
+      .map((r) => `${r.time},${new Date(r.time).toISOString()},${r.lat},${r.lng}`)
+      .join("\n");
+    const bumpHeader = "id,timestamp,iso_time,lat,lng,impact_g,status,photo_filename\n";
+    const bumpBody = sess.bumps
+      .map((b) => `${b.id},${b.timestamp},${new Date(b.timestamp).toISOString()},${b.lat},${b.lng},${b.impactG.toFixed(3)},${b.photoUrl ? "SAVED" : "UNPHOTOGRAPHED"},${b.photoFileName || "NONE"}`)
+      .join("\n");
+
+    const fullContent = `=== RIDE INFO ===\nTitle,${sess.title}\nSpot,${sess.spotName}\nBike,${sess.bikeType}\nDistanceKm,${sess.distanceKm.toFixed(2)}\n\n=== TRACK LOG ===\n${routeHeader}${routeBody}\n=== BUMPS DETECTED ===\n${bumpHeader}${bumpBody}`;
+
+    const blob = new Blob([fullContent], { type: "text/csv;charset=utf-8;" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `SESSION_${sess.id}_${sess.title.replace(/\s+/g, "_")}.csv`;
+    a.click();
+  };
+
+  const deleteSession = (sessionId: string) => {
+    if (!confirm("この走行セッション履歴を削除しますか？")) return;
+    const updated = allSessions.filter((s) => s.id !== sessionId);
+    saveSessions(updated);
+  };
+
+  const handleRenameSession = (sessionId: string) => {
+    if (!editingSessionTitle.trim()) return;
+    const updated = allSessions.map((s) =>
+      s.id === sessionId ? { ...s, title: editingSessionTitle.trim() } : s
+    );
+    saveSessions(updated);
+    setEditingSessionId(null);
+  };
+
+  // 計測開始/停止
   const toggleRecording = () => {
     if (!isRecording) {
       setCurrentRoute([]);
@@ -376,13 +462,12 @@ export default function CyclingDashboard() {
           spotName,
           bikeType,
           startTime: Date.now(),
-          route: currentRoute.map((p) => ({ lat: p.lat, lng: p.lng })),
-          bumps: allBumps.filter((b) => currentRoute.some((r) => Math.abs(r.time - b.timestamp) < 3600000)),
+          route: currentRoute,
+          bumps: allBumps.filter((b) => currentRoute.some((r) => Math.abs(r.time - b.timestamp) < 7200000)),
           distanceKm: totalDistanceKm,
         };
         const updated = [session, ...allSessions];
-        setAllSessions(updated);
-        localStorage.setItem("velo_sessions_history", JSON.stringify(updated));
+        saveSessions(updated);
       }
     }
   };
@@ -393,12 +478,13 @@ export default function CyclingDashboard() {
     return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   };
 
-  const unphotographedCount = allBumps.filter((b) => !b.photoUrl).length;
-  const savedCount = allBumps.filter((b) => !!b.photoUrl).length;
+  const unphotographedBumps = allBumps.filter((b) => !b.photoUrl);
+  const savedBumps = allBumps.filter((b) => !!b.photoUrl);
 
   return (
     <div className="flex flex-col h-[100dvh] bg-slate-950 text-slate-100 overflow-hidden font-sans select-none">
       
+      {/* カメラinput */}
       <input
         type="file"
         accept="image/*"
@@ -408,20 +494,18 @@ export default function CyclingDashboard() {
         className="hidden"
       />
 
-      {/* 常時表示: サイクルメーター領域 */}
+      {/* 常時表示: サイクルメーター */}
       <div className="bg-slate-900 border-b border-slate-800 p-3 shrink-0 shadow-xl z-20">
         <div className="flex justify-between items-center text-xs pb-1.5 border-b border-slate-800">
           <div className="flex items-center gap-2">
             <span className={`w-2.5 h-2.5 rounded-full ${isRecording ? "bg-red-500 animate-ping" : "bg-cyan-400"}`} />
             <span className="font-bold text-cyan-400">
-              {isRecording ? "AUTO LOGGING" : "STANDBY"}
+              {isRecording ? "LOGGING ACTIVE" : "STANDBY"}
             </span>
           </div>
           <div className="flex items-center gap-3 font-mono text-[11px]">
             <span className="text-slate-400">{formatTime(elapsedSeconds)}</span>
-            <button onClick={exportAllCSV} className="text-cyan-400 flex items-center gap-1 font-bold">
-              <Download className="w-3.5 h-3.5" /> CSV保存
-            </button>
+            <span className="text-emerald-400 font-bold">{totalDistanceKm.toFixed(2)} km</span>
             <a
               href="https://drive.google.com/drive/folders/1OyQd7HRAXA9FGUd-BAIP0j193wClvK5r?usp=sharing"
               target="_blank"
@@ -433,6 +517,7 @@ export default function CyclingDashboard() {
           </div>
         </div>
 
+        {/* 速度 ＆ G値 */}
         <div className="grid grid-cols-2 gap-2 items-center py-2">
           <div className="text-center border-r border-slate-800/80">
             <div className="text-[10px] text-slate-400 font-bold tracking-wider">SPEED</div>
@@ -453,27 +538,37 @@ export default function CyclingDashboard() {
           </div>
         </div>
 
-        <div className="flex items-center justify-between gap-2 pt-1">
+        {/* ボタン列: 計測ボタン + 目の前の段差即時撮影ボタン */}
+        <div className="flex items-center gap-2 pt-1">
           <button
             onClick={toggleRecording}
-            className={`flex-1 py-2 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 transition-transform active:scale-95 ${
+            className={`flex-1 py-2.5 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 transition-transform active:scale-95 ${
               isRecording 
                 ? "bg-rose-600 hover:bg-rose-500 text-white animate-pulse" 
                 : "bg-emerald-500 hover:bg-emerald-400 text-slate-950"
             }`}
           >
             {isRecording ? <Square className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
-            {isRecording ? "計測を停止" : "計測スタート"}
+            {isRecording ? "計測停止 (保存)" : "計測スタート"}
+          </button>
+
+          <button
+            onClick={triggerQuickCapture}
+            className="px-3.5 py-2.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl font-bold text-xs flex items-center gap-1.5 active:scale-95 shadow-lg"
+          >
+            <Camera className="w-4 h-4" />
+            <span>段差撮影</span>
           </button>
 
           <button
             onClick={() => setShowSettings(!showSettings)}
-            className="p-2 rounded-xl bg-slate-800 border border-slate-700 text-slate-300"
+            className="p-2.5 rounded-xl bg-slate-800 border border-slate-700 text-slate-300"
           >
             <Sliders className="w-4 h-4" />
           </button>
         </div>
 
+        {/* 感度調整 */}
         {showSettings && (
           <div className="mt-2 pt-2 border-t border-slate-800 flex items-center justify-between text-xs">
             <span className="text-slate-400 text-[11px]">検知閾値:</span>
@@ -491,104 +586,236 @@ export default function CyclingDashboard() {
         )}
       </div>
 
-      {/* メイン表示領域（タブ切り替え） */}
+      {/* メインビュー領域: 地図コンテナは破棄せず hidden で隠す */}
       <div className="flex-1 relative overflow-hidden bg-slate-950">
         
-        {/* ビュー 1: ライブマップ */}
-        {activeView === "live" && (
-          <div className="w-full h-full relative">
-            <div className="absolute top-2 left-2 z-[400] bg-slate-950/85 backdrop-blur-md px-3 py-1.5 rounded-xl border border-slate-800 flex gap-3 text-[11px]">
-              <span className="flex items-center gap-1 text-amber-400 font-bold">
-                <span className="w-2 h-2 rounded-full bg-amber-400" />
-                未撮影: {unphotographedCount}
-              </span>
-              <span className="flex items-center gap-1 text-emerald-400 font-bold">
-                <CheckCircle2 className="w-3 h-3" />
-                保存済: {savedCount}
-              </span>
+        {/* ビュー 1: ライブマップ (hidden 制御で破棄を防ぐ) */}
+        <div className={`w-full h-full relative ${activeView === "live" ? "block" : "hidden"}`}>
+          <div className="absolute top-2 left-2 z-[400] bg-slate-950/85 backdrop-blur-md px-3 py-1.5 rounded-xl border border-slate-800 flex gap-3 text-[11px]">
+            <span className="flex items-center gap-1 text-amber-400 font-bold">
+              <span className="w-2 h-2 rounded-full bg-amber-400" />
+              未撮影: {unphotographedBumps.length}
+            </span>
+            <span className="flex items-center gap-1 text-emerald-400 font-bold">
+              <CheckCircle2 className="w-3 h-3" />
+              保存済: {savedBumps.length}
+            </span>
+          </div>
+
+          <div ref={mapContainerRef} className="w-full h-full" />
+
+          {/* 接近アラート */}
+          {nearbyBump && (
+            <div className="absolute bottom-3 inset-x-3 z-[500] bg-slate-900 border border-amber-500 text-slate-100 p-3 rounded-2xl shadow-2xl flex items-center justify-between animate-bounce">
+              <div>
+                <div className="text-xs font-black text-amber-400 flex items-center gap-1">
+                  <AlertTriangle className="w-4 h-4" />
+                  未撮影の段差地点に接近中
+                </div>
+                <div className="text-[10px] text-slate-400 font-mono mt-0.5">
+                  {nearbyBump.id} ({nearbyBump.impactG.toFixed(2)}G)
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => triggerCameraForBump(nearbyBump)}
+                  className="px-3 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl text-xs font-bold flex items-center gap-1 active:scale-95"
+                >
+                  <Camera className="w-3.5 h-3.5" /> 撮影
+                </button>
+                <button
+                  onClick={() => deleteBump(nearbyBump.id)}
+                  className="px-2.5 py-2 bg-red-600/30 border border-red-500 text-red-300 rounded-xl text-xs font-bold flex items-center gap-1 active:scale-95"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* ビュー 2: 未撮影一覧 ＆ 登録写真ギャラリー */}
+        {activeView === "photos" && (
+          <div className="h-full overflow-y-auto p-3 space-y-4">
+            
+            {/* 未撮影段差セクション */}
+            <div>
+              <h3 className="text-xs font-bold text-amber-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                <AlertTriangle className="w-4 h-4" /> 撮影待ち段差 ({unphotographedBumps.length}地点)
+              </h3>
+              {unphotographedBumps.length === 0 ? (
+                <div className="text-xs text-slate-500 bg-slate-900 border border-slate-800 p-3 rounded-xl text-center">
+                  未撮影の段差はありません
+                </div>
+              ) : (
+                <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                  {unphotographedBumps.map((b) => (
+                    <div key={b.id} className="p-2.5 bg-slate-900 border border-slate-800 rounded-xl flex items-center justify-between text-xs">
+                      <div>
+                        <div className="font-mono text-cyan-300 font-bold">{b.impactG.toFixed(2)}G</div>
+                        <div className="text-[10px] text-slate-400">{new Date(b.timestamp).toLocaleTimeString()} ({b.lat.toFixed(4)}, {b.lng.toFixed(4)})</div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => triggerCameraForBump(b)}
+                          className="px-2.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-xs font-bold flex items-center gap-1"
+                        >
+                          <Camera className="w-3.5 h-3.5" /> 撮影
+                        </button>
+                        <button
+                          onClick={() => deleteBump(b.id)}
+                          className="p-1.5 bg-red-950 text-red-400 rounded-lg hover:bg-red-900"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
-            <div ref={mapContainerRef} className="w-full h-full" />
-
-            {nearbyBump && (
-              <div className="absolute bottom-3 inset-x-3 z-[500] bg-slate-900 border border-amber-500 text-slate-100 p-3 rounded-2xl shadow-2xl flex items-center justify-between animate-bounce">
-                <div>
-                  <div className="text-xs font-black text-amber-400 flex items-center gap-1">
-                    <AlertTriangle className="w-4 h-4" />
-                    未撮影の段差地点に接近中
-                  </div>
-                  <div className="text-[10px] text-slate-400 font-mono mt-0.5">
-                    {nearbyBump.id} ({nearbyBump.impactG.toFixed(2)}G)
-                  </div>
+            {/* 保存済み写真ギャラリー */}
+            <div>
+              <h3 className="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                <CheckCircle2 className="w-4 h-4" /> 保存済み写真 ({savedBumps.length}枚)
+              </h3>
+              {savedBumps.length === 0 ? (
+                <div className="text-xs text-slate-500 bg-slate-900 border border-slate-800 p-3 rounded-xl text-center">
+                  保存済みの写真はありません
                 </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => {
-                      setTargetBump(nearbyBump);
-                      fileInputRef.current?.click();
-                    }}
-                    className="px-3 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl text-xs font-bold flex items-center gap-1 active:scale-95"
-                  >
-                    <Camera className="w-3.5 h-3.5" /> 撮影
-                  </button>
-                  <button
-                    onClick={() => deleteBump(nearbyBump.id)}
-                    className="px-2.5 py-2 bg-red-600/30 border border-red-500 text-red-300 rounded-xl text-xs font-bold flex items-center gap-1 active:scale-95"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ビュー 2: 段差写真ギャラリー */}
-        {activeView === "photos" && (
-          <div className="h-full overflow-y-auto p-4 space-y-3">
-            <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
-              <ImageIcon className="w-4 h-4 text-cyan-400" /> 登録済み段差写真 ({savedCount}枚)
-            </h3>
-            {savedCount === 0 ? (
-              <div className="text-xs text-slate-500 text-center py-10">まだ写真が登録された段差はありません。</div>
-            ) : (
-              <div className="grid grid-cols-2 gap-2.5">
-                {allBumps.filter((b) => b.photoUrl).map((bump) => (
-                  <div key={bump.id} className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-lg">
-                    <img src={bump.photoUrl} alt="段差" className="w-full h-28 object-cover" />
-                    <div className="p-2 space-y-1">
-                      <div className="text-[10px] font-bold text-emerald-400 flex items-center justify-between">
-                        <span>{bump.impactG.toFixed(2)}G</span>
-                        <span className="text-slate-500">{new Date(bump.timestamp).toLocaleDateString()}</span>
+              ) : (
+                <div className="grid grid-cols-2 gap-2">
+                  {savedBumps.map((bump) => (
+                    <div key={bump.id} className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-lg relative group">
+                      <img src={bump.photoUrl} alt="段差" className="w-full h-24 object-cover" />
+                      <div className="p-2 space-y-0.5">
+                        <div className="text-[10px] font-bold text-emerald-400 flex items-center justify-between">
+                          <span>{bump.impactG.toFixed(2)}G</span>
+                          <span className="text-slate-500 font-mono text-[9px]">{new Date(bump.timestamp).toLocaleDateString()}</span>
+                        </div>
+                        <div className="text-[9px] text-slate-400 font-mono truncate">{bump.photoFileName}</div>
                       </div>
-                      <div className="text-[9px] text-slate-400 font-mono truncate">{bump.photoFileName}</div>
+                      <button
+                        onClick={() => deleteBump(bump.id)}
+                        className="absolute top-1 right-1 p-1 bg-slate-950/80 text-red-400 rounded-md"
+                        title="削除"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
                     </div>
-                  </div>
-                ))}
-              </div>
-            )}
+                  ))}
+                </div>
+              )}
+            </div>
+
           </div>
         )}
 
-        {/* ビュー 3: 過去走行セッション履歴 */}
+        {/* ビュー 3: 走行セッション履歴（DL・リネーム・削除） */}
         {activeView === "sessions" && (
-          <div className="h-full overflow-y-auto p-4 space-y-3">
+          <div className="h-full overflow-y-auto p-3 space-y-3">
             <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
-              <History className="w-4 h-4 text-cyan-400" /> 走行セッション履歴 ({allSessions.length}件)
+              <History className="w-4 h-4 text-cyan-400" /> 走行セッション一覧 ({allSessions.length}件)
             </h3>
             {allSessions.length === 0 ? (
-              <div className="text-xs text-slate-500 text-center py-10">セッション履歴がありません。計測を完了すると蓄積されます。</div>
+              <div className="text-xs text-slate-500 text-center py-10 bg-slate-900 border border-slate-800 rounded-xl">
+                セッション履歴がありません。計測を完了すると蓄積されます。
+              </div>
             ) : (
-              <div className="space-y-2">
+              <div className="space-y-2.5">
                 {allSessions.map((s) => (
-                  <div key={s.id} className="bg-slate-900 border border-slate-800 rounded-xl p-3 text-xs space-y-1">
-                    <div className="font-bold text-slate-200">{s.title}</div>
-                    <div className="text-[11px] text-slate-400">{s.spotName} • {s.bikeType}</div>
-                    <div className="flex justify-between items-center text-[10px] text-slate-500 pt-1 border-t border-slate-800/60 font-mono">
-                      <span>{new Date(s.startTime).toLocaleDateString()}</span>
+                  <div key={s.id} className="bg-slate-900 border border-slate-800 rounded-xl p-3 text-xs space-y-2">
+                    
+                    {/* タイトル ＆ リネーム入力 */}
+                    <div className="flex items-center justify-between gap-2">
+                      {editingSessionId === s.id ? (
+                        <div className="flex items-center gap-1.5 flex-1">
+                          <input
+                            type="text"
+                            value={editingSessionTitle}
+                            onChange={(e) => setEditingSessionTitle(e.target.value)}
+                            className="flex-1 bg-slate-950 border border-cyan-500 rounded px-2 py-1 text-xs text-slate-100 outline-none"
+                            autoFocus
+                          />
+                          <button
+                            onClick={() => handleRenameSession(s.id)}
+                            className="p-1 bg-cyan-600 rounded text-white"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-1.5 flex-1">
+                          <span className="font-bold text-slate-200">{s.title}</span>
+                          <button
+                            onClick={() => {
+                              setEditingSessionId(s.id);
+                              setEditingSessionTitle(s.title);
+                            }}
+                            className="text-slate-500 hover:text-slate-300"
+                          >
+                            <Edit2 className="w-3 h-3" />
+                          </button>
+                        </div>
+                      )}
+                      <span className="text-[10px] text-slate-500 font-mono">
+                        {new Date(s.startTime).toLocaleDateString()}
+                      </span>
+                    </div>
+
+                    <div className="text-[11px] text-slate-400">
+                      {s.spotName} • {s.bikeType}
+                    </div>
+
+                    <div className="flex justify-between items-center text-[10px] text-slate-400 pt-1.5 border-t border-slate-800/80 font-mono">
                       <span className="text-cyan-400">{s.distanceKm.toFixed(2)} km</span>
                       <span className="text-amber-400">段差: {s.bumps.length}件</span>
+                      <span>{s.route.length} pts</span>
                     </div>
+
+                    {/* 操作ボタン列 */}
+                    <div className="flex items-center justify-end gap-2 pt-1">
+                      <button
+                        onClick={() => downloadSessionCSV(s)}
+                        className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 rounded-lg text-[10px] font-bold flex items-center gap-1"
+                      >
+                        <Download className="w-3 h-3" /> CSV保存
+                      </button>
+                      <button
+                        onClick={() => deleteSession(s.id)}
+                        className="px-2.5 py-1 bg-red-950/60 hover:bg-red-900 text-red-400 border border-red-900/60 rounded-lg text-[10px] font-bold flex items-center gap-1"
+                      >
+                        <Trash2 className="w-3 h-3" /> 削除
+                      </button>
+                      <button
+                        onClick={() => setExpandedSessionId(expandedSessionId === s.id ? null : s.id)}
+                        className="p-1 text-slate-500"
+                      >
+                        {expandedSessionId === s.id ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                      </button>
+                    </div>
+
+                    {/* 詳細展開: 段差内訳 */}
+                    {expandedSessionId === s.id && (
+                      <div className="mt-2 pt-2 border-t border-slate-800 space-y-1">
+                        <div className="text-[10px] text-slate-400 font-bold mb-1">段差検出ログ:</div>
+                        {s.bumps.length === 0 ? (
+                          <div className="text-[10px] text-slate-600">記録された段差はありません</div>
+                        ) : (
+                          s.bumps.map((b) => (
+                            <div key={b.id} className="p-1.5 bg-slate-950 rounded flex justify-between items-center text-[10px]">
+                              <span>{b.id}</span>
+                              <span className="text-amber-400 font-bold">{b.impactG.toFixed(2)}G</span>
+                              <span className={b.photoUrl ? "text-emerald-400" : "text-slate-500"}>
+                                {b.photoUrl ? "写真あり" : "未撮影"}
+                              </span>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    )}
+
                   </div>
                 ))}
               </div>
@@ -596,11 +823,11 @@ export default function CyclingDashboard() {
           </div>
         )}
 
-        {/* ビュー 4: メタデータ編集 */}
+        {/* ビュー 4: メタデータ設定 */}
         {activeView === "meta" && (
           <div className="h-full overflow-y-auto p-4 space-y-4">
             <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
-              <FileText className="w-4 h-4 text-cyan-400" /> 走行メタデータ設定
+              <FileText className="w-4 h-4 text-cyan-400" /> 次回走行のメタデータ事前登録
             </h3>
             <div className="space-y-3 bg-slate-900 border border-slate-800 rounded-2xl p-4">
               <div>
@@ -636,7 +863,7 @@ export default function CyclingDashboard() {
 
       </div>
 
-      {/* 下部切り替えタブバー */}
+      {/* 下部ナビゲーションタブ */}
       <nav className="h-12 bg-slate-900 border-t border-slate-800 grid grid-cols-4 shrink-0 text-[10px]">
         <button
           onClick={() => setActiveView("live")}
@@ -651,7 +878,7 @@ export default function CyclingDashboard() {
           className={`flex flex-col items-center justify-center gap-0.5 ${activeView === "photos" ? "text-cyan-400 font-bold" : "text-slate-500"}`}
         >
           <ImageIcon className="w-4 h-4" />
-          <span>写真</span>
+          <span>未撮影/写真</span>
         </button>
 
         <button
@@ -659,7 +886,7 @@ export default function CyclingDashboard() {
           className={`flex flex-col items-center justify-center gap-0.5 ${activeView === "sessions" ? "text-cyan-400 font-bold" : "text-slate-500"}`}
         >
           <History className="w-4 h-4" />
-          <span>履歴</span>
+          <span>履歴・DL</span>
         </button>
 
         <button
