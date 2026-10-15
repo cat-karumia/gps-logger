@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>GPS & 予備センサーロガー</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f172a;
+      color: #f8fafc;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+    header { margin-bottom: 14px; text-align: center; }
+    h1 { font-size: 19px; font-weight: 700; color: #38bdf8; }
+    #badge {
+      display: inline-block;
+      margin-top: 4px;
+      padding: 3px 10px;
+      border-radius: 9999px;
+      font-size: 12px;
+      background: #334155;
+      color: #94a3b8;
+    }
+    #badge.active { background: #065f46; color: #34d399; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+    .card { background: #1e293b; padding: 12px; border-radius: 10px; border: 1px solid #334155; }
+    .card.full { grid-column: span 2; }
+    .label { font-size: 11px; font-weight: 600; color: #94a3b8; text-transform: uppercase; margin-bottom: 3px; }
+    .value { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 20px; font-weight: 700; }
+    .unit { font-size: 12px; font-weight: 400; color: #64748b; margin-left: 2px; }
+    .actions { display: flex; flex-direction: column; gap: 8px; margin-top: auto; }
+    button {
+      width: 100%;
+      padding: 15px;
+      font-size: 16px;
+      font-weight: 700;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.35; cursor: not-allowed; }
+    #btnStart { background: #0284c7; color: #fff; }
+    #btnStop { background: #ef4444; color: #fff; }
+    #btnDownload { background: #10b981; color: #fff; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>GPS & 予備センサーロガー</h1>
+    <div id="badge">待機中</div>
+  </header>
+
+  <div class="grid">
+    <div class="card full">
+      <div class="label">記録件数 / タイムスタンプ</div>
+      <div id="valCount" class="value">0 <span class="unit">件</span></div>
+      <div id="valTime" style="font-size: 12px; color: #64748b; font-family: monospace; margin-top: 3px;">-</div>
+    </div>
+    <div class="card">
+      <div class="label">GPS速度</div>
+      <div class="value"><span id="valSpeed">0.0</span><span class="unit">km/h</span></div>
+    </div>
+    <div class="card">
+      <div class="label">測位精度</div>
+      <div class="value"><span id="valAcc">-</span><span class="unit">m</span></div>
+    </div>
+    <div class="card">
+      <div class="label">予備 騒音(RMS)</div>
+      <div class="value"><span id="valNoise">0.0</span><span class="unit">RMS</span></div>
+    </div>
+    <div class="card">
+      <div class="label">予備 衝撃(G)</div>
+      <div class="value"><span id="valImpact">0.00</span><span class="unit">G</span></div>
+    </div>
+    <div class="card full">
+      <div class="label">GPS座標</div>
+      <div id="valCoords" class="value" style="font-size: 14px;">未取得</div>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button id="btnStart">ロギング開始</button>
+    <button id="btnStop" disabled>一時停止</button>
+    <button id="btnDownload" disabled>CSV 保存</button>
+  </div>
+
+  <script>
+    let watchId = null;
+    let wakeLock = null;
+    let audioCtx = null, analyser = null, micStream = null;
+    let logTimer = null;
+
+    let curLat = "", curLng = "", curAlt = "", curSpd = "0.0", curAcc = "";
+    let curRms = 0.0, curImpact = 0.0;
+
+    // CSVヘッダー設計
+    let records = [["timestamp", "latitude", "longitude", "altitude", "speed", "accuracy", "sub_noise_rms", "sub_impact_g"]];
+
+    const btnStart = document.getElementById('btnStart');
+    const btnStop = document.getElementById('btnStop');
+    const btnDownload = document.getElementById('btnDownload');
+    const badge = document.getElementById('badge');
+
+    // 画面スリープ防止
+    async function acquireLock() {
+      if ('wakeLock' in navigator) {
+        try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+      }
+    }
+
+    // マイク初期化
+    async function initAudio() {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = audioCtx.createMediaStreamSource(micStream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      src.connect(analyser);
+    }
+
+    const audioBuf = new Float32Array(256);
+    function calcAudio() {
+      if (!analyser) return;
+      analyser.getFloatTimeDomainData(audioBuf);
+      let sum = 0;
+      for (let i = 0; i < audioBuf.length; i++) sum += audioBuf[i] * audioBuf[i];
+      curRms = Math.sqrt(sum / audioBuf.length) * 100.0;
+      document.getElementById('valNoise').innerText = curRms.toFixed(1);
+    }
+
+    // 加速度 (衝撃検知)
+    window.addEventListener('devicemotion', (e) => {
+      const a = e.accelerationIncludingGravity;
+      if (a && a.x !== null) {
+        const total = Math.sqrt(a.x**2 + a.y**2 + a.z**2);
+        curImpact = Math.abs((total / 9.80665) - 1.0);
+        document.getElementById('valImpact').innerText = curImpact.toFixed(2);
+      }
+    });
+
+    btnStart.addEventListener('click', async () => {
+      try { await initAudio(); } catch (e) {}
+      await acquireLock();
+
+      watchId = navigator.geolocation.watchPosition(
+        (pos) => {
+          curLat = pos.coords.latitude.toFixed(6);
+          curLng = pos.coords.longitude.toFixed(6);
+          curAlt = pos.coords.altitude !== null ? pos.coords.altitude.toFixed(1) : "";
+          curSpd = pos.coords.speed !== null && pos.coords.speed >= 0 ? (pos.coords.speed * 3.6).toFixed(1) : "0.0";
+          curAcc = pos.coords.accuracy ? pos.coords.accuracy.toFixed(1) : "";
+
+          document.getElementById('valSpeed').innerText = curSpd;
+          document.getElementById('valAcc').innerText = curAcc;
+          document.getElementById('valCoords').innerText = `${curLat}, ${curLng}`;
+        },
+        (err) => { document.getElementById('valCoords').innerText = `GPS: ${err.message}`; },
+        { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
+      );
+
+      // 100ms周期 (10Hz) 打刻
+      logTimer = setInterval(() => {
+        calcAudio();
+        const now = Date.now();
+        records.push([now, curLat, curLng, curAlt, curSpd, curAcc, curRms.toFixed(2), curImpact.toFixed(2)]);
+
+        document.getElementById('valCount').innerHTML = `${records.length - 1} <span class="unit">件</span>`;
+        document.getElementById('valTime').innerText = now;
+      }, 100);
+
+      badge.innerText = "記録中";
+      badge.classList.add('active');
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+      btnDownload.disabled = true;
+    });
+
+    btnStop.addEventListener('click', () => {
+      if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+      if (logTimer !== null) clearInterval(logTimer);
+      if (micStream) micStream.getTracks().forEach(t => t.stop());
+      if (audioCtx) audioCtx.close();
+      if (wakeLock) wakeLock.release().then(() => wakeLock = null);
+
+      badge.innerText = "停止中";
+      badge.classList.remove('active');
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      btnDownload.disabled = records.length <= 1;
+    });
+
+    btnDownload.addEventListener('click', () => {
+      const csvStr = records.map(r => r.join(",")).join("\r\n");
+      const blob = new Blob([csvStr], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `mobile_backup_log_${Date.now()}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    });
+  </script>
+</body>
+</html>
