@@ -1,9 +1,16 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "VeloTelemetry - サイクリング衝撃・騒音ダッシュボード",
-  description: "M5Stack 6-Axis IMU & Sound Sync Dashboard",
+  title: "VeloTelemetry Live Tracker",
+  description: "M5Stack & GPS Realtime Cycling Tracker",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
 };
 
 export default function RootLayout({
@@ -21,7 +28,9 @@ export default function RootLayout({
           crossOrigin=""
         />
       </head>
-      <body className="bg-slate-950 text-slate-100 antialiased">{children}</body>
+      <body className="bg-slate-950 text-slate-100 antialiased overflow-x-hidden">
+        {children}
+      </body>
     </html>
   );
 }
