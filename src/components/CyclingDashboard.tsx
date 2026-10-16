@@ -19,8 +19,14 @@ import {
   Edit2,
   Check,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  RefreshCw,
+  Database
 } from "lucide-react";
+
+// Google Drive 設定 (GitHub Pages用フロントエンド直叩き)
+const GOOGLE_API_KEY = "AIzaSyAYislWzcpW08gA9kDP19jL72UF0E_1h6Y";
+const DRIVE_FOLDER_ID = "1OyQd7HRAXA9FGUd-BAIP0j193wClvK5r";
 
 interface BumpPoint {
   id: string;
@@ -64,6 +70,10 @@ export default function CyclingDashboard() {
   const [currentRoute, setCurrentRoute] = useState<{ lat: number; lng: number; time: number; speed: number }[]>([]);
   const [allSessions, setAllSessions] = useState<RideSession[]>([]);
   const [nearbyBump, setNearbyBump] = useState<BumpPoint | null>(null);
+
+  // Google Drive 同期状態
+  const [isSyncingDrive, setIsSyncingDrive] = useState(false);
+  const [syncStatusMsg, setSyncStatusMsg] = useState<string | null>(null);
 
   // セッション編集状態
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
@@ -159,13 +169,116 @@ export default function CyclingDashboard() {
     localStorage.setItem("velo_sessions_history", JSON.stringify(sessions));
   };
 
-  // 2. 加速度センサー開始（iOS許可要求を明示的に処理）
+  // 2. Google Drive API から最新の M5_*.csv を直接フェッチ＆突合
+  const fetchAndSyncFromGoogleDrive = async () => {
+    setIsSyncingDrive(true);
+    setSyncStatusMsg("Googleドライブ内を検索中...");
+
+    try {
+      // フォルダ内のファイルリストを取得
+      const listUrl = `https://www.googleapis.com/drive/v3/files?q='${DRIVE_FOLDER_ID}'+in+parents+and+trashed=false&fields=files(id,name,modifiedTime)&orderBy=modifiedTime+desc&key=${GOOGLE_API_KEY}`;
+      const listRes = await fetch(listUrl);
+      if (!listRes.ok) {
+        const errJson = await listRes.json();
+        throw new Error(errJson.error?.message || "ファイル一覧取得に失敗しました");
+      }
+      const listData = await listRes.json();
+      const files = listData.files || [];
+
+      // M5 CSV を特定
+      const m5File = files.find((f: any) => f.name.startsWith("M5_") && f.name.endsWith(".csv"));
+      if (!m5File) {
+        setSyncStatusMsg("ドライブ内に M5_*.csv が見つかりませんでした。");
+        return;
+      }
+
+      setSyncStatusMsg(`${m5File.name} をダウンロード中...`);
+
+      // ファイル本文（CSVメディア）を取得
+      const fileUrl = `https://www.googleapis.com/drive/v3/files/${m5File.id}?alt=media&key=${GOOGLE_API_KEY}`;
+      const fileRes = await fetch(fileUrl);
+      if (!fileRes.ok) throw new Error("CSVの中身の取得に失敗しました。");
+      const csvText = await fileRes.text();
+
+      // パース処理
+      const lines = csvText.trim().split("\n");
+      if (lines.length <= 1) {
+        setSyncStatusMsg("CSVにデータが含まれていません。");
+        return;
+      }
+
+      const headers = lines[0].split(",").map((h) => h.trim());
+      const epochIdx = headers.indexOf("epoch_ms");
+      const impactIdx = headers.indexOf("impact_g");
+
+      if (epochIdx === -1 || impactIdx === -1) {
+        throw new Error("CSVフォーマットが不正です (epoch_ms, impact_g 列が必須)");
+      }
+
+      let parsedCount = 0;
+      let newBumpsFound = 0;
+      const detectedBumps: BumpPoint[] = [];
+
+      for (let i = 1; i < lines.length; i++) {
+        const cols = lines[i].split(",");
+        if (cols.length < headers.length) continue;
+
+        const ts = parseInt(cols[epochIdx], 10);
+        const gVal = parseFloat(cols[impactIdx]);
+        parsedCount++;
+
+        if (gVal >= thresholdG) {
+          // 走行ルートから時刻が最も近いGPS位置を探して結合
+          let matchedLat = currentPosRef.current.lat;
+          let matchedLng = currentPosRef.current.lng;
+
+          if (currentRouteRef.current.length > 0) {
+            let minDiff = Infinity;
+            for (const r of currentRouteRef.current) {
+              const diff = Math.abs(r.time - ts);
+              if (diff < minDiff) {
+                minDiff = diff;
+                matchedLat = r.lat;
+                matchedLng = r.lng;
+              }
+            }
+          }
+
+          detectedBumps.push({
+            id: `M5_${formatDateTimeId(ts)}`,
+            lat: matchedLat,
+            lng: matchedLng,
+            impactG: gVal,
+            timestamp: ts,
+          });
+          newBumpsFound++;
+        }
+      }
+
+      // 重複排除して保存
+      const existingIds = new Set(allBumps.map((b) => b.id));
+      const freshBumps = detectedBumps.filter((b) => !existingIds.has(b.id));
+
+      if (freshBumps.length > 0) {
+        saveBumps([...freshBumps, ...allBumps]);
+      }
+
+      setSyncStatusMsg(`同期完了: ${m5File.name} (${parsedCount}行中、閾値超え段差 ${newBumpsFound}件を結合)`);
+    } catch (err: any) {
+      console.error("Drive Sync Error:", err);
+      setSyncStatusMsg(`同期エラー: ${err.message}`);
+    } finally {
+      setIsSyncingDrive(false);
+    }
+  };
+
+  // 3. 加速度センサー開始（予備用・iOS Safari許可明示）
   const startMotionSensor = async () => {
     if (typeof (DeviceMotionEvent as any) !== "undefined" && typeof (DeviceMotionEvent as any).requestPermission === "function") {
       try {
         const permissionState = await (DeviceMotionEvent as any).requestPermission();
         if (permissionState !== "granted") {
-          alert("加速度センサーの利用が許可されませんでした。設定からブラウザの動作と方向を許可してください。");
+          alert("加速度センサーの利用が許可されませんでした。");
           return;
         }
       } catch (e) {
@@ -220,7 +333,7 @@ export default function CyclingDashboard() {
     }
   };
 
-  // 3. GPS追従
+  // 4. GPS追従
   const startGpsTracking = () => {
     if (!navigator.geolocation) return;
 
@@ -322,7 +435,7 @@ export default function CyclingDashboard() {
     }
   };
 
-  // 4. 地図初期化
+  // 5. 地図初期化
   useEffect(() => {
     const initMap = () => {
       if (!mapContainerRef.current || mapRef.current) return;
@@ -776,10 +889,34 @@ export default function CyclingDashboard() {
           </div>
         )}
 
-        {/* ビュー 3: 履歴 */}
+        {/* ビュー 3: 履歴 ＆ Google Drive 同期 */}
         {activeView === "sessions" && (
           <div className="h-full overflow-y-auto p-3 space-y-3">
-            <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+            
+            {/* Google Drive 同期コントロールパネル */}
+            <div className="bg-slate-900 border border-cyan-800/60 rounded-2xl p-3 shadow-lg">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-bold text-cyan-300 flex items-center gap-1.5">
+                  <Database className="w-4 h-4" /> Googleドライブ自動同期
+                </span>
+                <span className="text-[10px] text-slate-400 font-mono">API v3 直結</span>
+              </div>
+              <button
+                onClick={fetchAndSyncFromGoogleDrive}
+                disabled={isSyncingDrive}
+                className="w-full py-2.5 bg-cyan-600 hover:bg-cyan-500 disabled:bg-slate-800 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 active:scale-95 transition-all shadow-md"
+              >
+                <RefreshCw className={`w-4 h-4 ${isSyncingDrive ? "animate-spin" : ""}`} />
+                {isSyncingDrive ? "同期処理中..." : "🔄 ドライブから最新M5ログを取り込む"}
+              </button>
+              {syncStatusMsg && (
+                <div className="mt-2 text-[10px] text-slate-300 bg-slate-950/80 p-2 rounded-lg border border-slate-800 break-all font-mono">
+                  {syncStatusMsg}
+                </div>
+              )}
+            </div>
+
+            <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5 pt-1">
               <History className="w-4 h-4 text-cyan-400" /> 走行セッション一覧 ({allSessions.length}件)
             </h3>
             {allSessions.length === 0 ? (
