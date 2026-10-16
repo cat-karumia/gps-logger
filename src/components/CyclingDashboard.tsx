@@ -169,13 +169,12 @@ export default function CyclingDashboard() {
     localStorage.setItem("velo_sessions_history", JSON.stringify(sessions));
   };
 
-  // 2. Google Drive API から最新の M5_*.csv を直接フェッチ＆突合
+  // 2. Google Drive からの柔軟なインポート（朝のGPS座標ログもM5ログも両方救済）
   const fetchAndSyncFromGoogleDrive = async () => {
     setIsSyncingDrive(true);
     setSyncStatusMsg("Googleドライブ内を検索中...");
 
     try {
-      // フォルダ内のファイルリストを取得
       const listUrl = `https://www.googleapis.com/drive/v3/files?q='${DRIVE_FOLDER_ID}'+in+parents+and+trashed=false&fields=files(id,name,modifiedTime)&orderBy=modifiedTime+desc&key=${GOOGLE_API_KEY}`;
       const listRes = await fetch(listUrl);
       if (!listRes.ok) {
@@ -183,59 +182,94 @@ export default function CyclingDashboard() {
         throw new Error(errJson.error?.message || "ファイル一覧取得に失敗しました");
       }
       const listData = await listRes.json();
-      const files = listData.files || [];
+      const files: any[] = listData.files || [];
 
-      // M5 CSV を特定
-      const m5File = files.find((f: any) => f.name.startsWith("M5_") && f.name.endsWith(".csv"));
-      if (!m5File) {
-        setSyncStatusMsg("ドライブ内に M5_*.csv が見つかりませんでした。");
+      // ドライブ内のすべての CSV ファイルを対象にする
+      const csvFiles = files.filter((f) => f.name.toLowerCase().endsWith(".csv"));
+      if (csvFiles.length === 0) {
+        setSyncStatusMsg("ドライブ内にCSVファイルが見つかりませんでした。");
         return;
       }
 
-      setSyncStatusMsg(`${m5File.name} をダウンロード中...`);
+      // 最新のCSVを取得
+      const targetFile = csvFiles[0];
+      setSyncStatusMsg(`${targetFile.name} を解析中...`);
 
-      // ファイル本文（CSVメディア）を取得
-      const fileUrl = `https://www.googleapis.com/drive/v3/files/${m5File.id}?alt=media&key=${GOOGLE_API_KEY}`;
+      const fileUrl = `https://www.googleapis.com/drive/v3/files/${targetFile.id}?alt=media&key=${GOOGLE_API_KEY}`;
       const fileRes = await fetch(fileUrl);
-      if (!fileRes.ok) throw new Error("CSVの中身の取得に失敗しました。");
+      if (!fileRes.ok) throw new Error("CSV本文の取得に失敗しました。");
       const csvText = await fileRes.text();
 
-      // パース処理
-      const lines = csvText.trim().split("\n");
+      // セクション分割（[TRACK_LOG] や [BUMP_LOG] が入っている独自形式にも対応）
+      const lines = csvText.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
       if (lines.length <= 1) {
-        setSyncStatusMsg("CSVにデータが含まれていません。");
+        setSyncStatusMsg("CSVに有効なデータがありません。");
         return;
       }
 
-      const headers = lines[0].split(",").map((h) => h.trim());
-      const epochIdx = headers.indexOf("epoch_ms");
-      const impactIdx = headers.indexOf("impact_g");
-
-      if (epochIdx === -1 || impactIdx === -1) {
-        throw new Error("CSVフォーマットが不正です (epoch_ms, impact_g 列が必須)");
+      // ヘッダー行を探す（[TRACK_LOG] などのタグをスキップ）
+      let headerIdx = 0;
+      while (headerIdx < lines.length && (lines[headerIdx].startsWith("[") || !lines[headerIdx].includes(","))) {
+        headerIdx++;
       }
 
-      let parsedCount = 0;
-      let newBumpsFound = 0;
-      const detectedBumps: BumpPoint[] = [];
+      const headers = lines[headerIdx].split(",").map((h) => h.trim().toLowerCase());
+      
+      // カラム位置を柔軟に特定
+      const latIdx = headers.findIndex((h) => h === "lat" || h === "latitude");
+      const lngIdx = headers.findIndex((h) => h === "lng" || h === "longitude" || h === "lon");
+      const timeIdx = headers.findIndex((h) => h === "epoch_ms" || h === "time" || h === "timestamp");
+      const impactIdx = headers.findIndex((h) => h === "impact_g" || h === "impactg" || h === "g");
+      const idIdx = headers.findIndex((h) => h === "bump_id" || h === "id");
 
-      for (let i = 1; i < lines.length; i++) {
-        const cols = lines[i].split(",");
-        if (cols.length < headers.length) continue;
+      let loadedBumpsCount = 0;
+      const loadedBumps: BumpPoint[] = [];
+      const loadedRoute: { lat: number; lng: number; time: number; speed: number }[] = [];
 
-        const ts = parseInt(cols[epochIdx], 10);
-        const gVal = parseFloat(cols[impactIdx]);
-        parsedCount++;
+      for (let i = headerIdx + 1; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.startsWith("[")) continue; // セクションヘッダーはスキップ
 
-        if (gVal >= thresholdG) {
-          // 走行ルートから時刻が最も近いGPS位置を探して結合
+        const cols = line.split(",").map((c) => c.trim());
+        if (cols.length < 2) continue;
+
+        const rawLat = latIdx !== -1 ? parseFloat(cols[latIdx]) : NaN;
+        const rawLng = lngIdx !== -1 ? parseFloat(cols[lngIdx]) : NaN;
+        const rawTime = timeIdx !== -1 ? parseInt(cols[timeIdx], 10) : Date.now();
+        const rawG = impactIdx !== -1 ? parseFloat(cols[impactIdx]) : 2.5; // G値列がない朝のログなら閾値以上として扱う
+        const rawId = idIdx !== -1 ? cols[idIdx] : `BUMP_${formatDateTimeId(isNaN(rawTime) ? Date.now() : rawTime)}_${i}`;
+
+        // 1. 座標が生きているデータの場合（朝のログ）
+        if (!isNaN(rawLat) && !isNaN(rawLng) && rawLat !== 0 && rawLng !== 0) {
+          loadedRoute.push({
+            lat: rawLat,
+            lng: rawLng,
+            time: isNaN(rawTime) ? Date.now() : rawTime,
+            speed: 0,
+          });
+
+          // G値が存在して閾値以上、または明示的な段差レコードならピンに追加
+          if (rawG >= thresholdG || impactIdx === -1) {
+            loadedBumps.push({
+              id: rawId,
+              lat: rawLat,
+              lng: rawLng,
+              impactG: isNaN(rawG) ? 2.5 : rawG,
+              timestamp: isNaN(rawTime) ? Date.now() : rawTime,
+            });
+            loadedBumpsCount++;
+          }
+        }
+        // 2. 座標がなくM5側のタイムスタンプ＋G値のみのデータの場合
+        else if (rawG >= thresholdG && !isNaN(rawTime)) {
+          // 既存の走行ルートから時刻突合
           let matchedLat = currentPosRef.current.lat;
           let matchedLng = currentPosRef.current.lng;
 
           if (currentRouteRef.current.length > 0) {
             let minDiff = Infinity;
             for (const r of currentRouteRef.current) {
-              const diff = Math.abs(r.time - ts);
+              const diff = Math.abs(r.time - rawTime);
               if (diff < minDiff) {
                 minDiff = diff;
                 matchedLat = r.lat;
@@ -244,26 +278,30 @@ export default function CyclingDashboard() {
             }
           }
 
-          detectedBumps.push({
-            id: `M5_${formatDateTimeId(ts)}`,
+          loadedBumps.push({
+            id: `M5_${formatDateTimeId(rawTime)}`,
             lat: matchedLat,
             lng: matchedLng,
-            impactG: gVal,
-            timestamp: ts,
+            impactG: rawG,
+            timestamp: rawTime,
           });
-          newBumpsFound++;
+          loadedBumpsCount++;
         }
       }
 
-      // 重複排除して保存
+      // 既存データとマージして保存
+      if (loadedRoute.length > 0) {
+        setCurrentRoute((prev) => [...prev, ...loadedRoute]);
+      }
+
       const existingIds = new Set(allBumps.map((b) => b.id));
-      const freshBumps = detectedBumps.filter((b) => !existingIds.has(b.id));
+      const freshBumps = loadedBumps.filter((b) => !existingIds.has(b.id));
 
       if (freshBumps.length > 0) {
         saveBumps([...freshBumps, ...allBumps]);
       }
 
-      setSyncStatusMsg(`同期完了: ${m5File.name} (${parsedCount}行中、閾値超え段差 ${newBumpsFound}件を結合)`);
+      setSyncStatusMsg(`同期成功: ${targetFile.name} (座標点: ${loadedRoute.length}件, 段差: ${loadedBumpsCount}件を復元)`);
     } catch (err: any) {
       console.error("Drive Sync Error:", err);
       setSyncStatusMsg(`同期エラー: ${err.message}`);
@@ -907,7 +945,7 @@ export default function CyclingDashboard() {
                 className="w-full py-2.5 bg-cyan-600 hover:bg-cyan-500 disabled:bg-slate-800 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 active:scale-95 transition-all shadow-md"
               >
                 <RefreshCw className={`w-4 h-4 ${isSyncingDrive ? "animate-spin" : ""}`} />
-                {isSyncingDrive ? "同期処理中..." : "🔄 ドライブから最新M5ログを取り込む"}
+                {isSyncingDrive ? "同期処理中..." : "🔄 ドライブから最新M5/GPSログを取り込む"}
               </button>
               {syncStatusMsg && (
                 <div className="mt-2 text-[10px] text-slate-300 bg-slate-950/80 p-2 rounded-lg border border-slate-800 break-all font-mono">
