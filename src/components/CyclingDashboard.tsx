@@ -27,7 +27,7 @@ interface BumpPoint {
   lat: number;
   lng: number;
   impactG: number;
-  timestamp: number; // M5突合用 epoch_ms (13桁ミリ秒)
+  timestamp: number;
   photoUrl?: string;
   photoFileName?: string;
 }
@@ -88,6 +88,7 @@ export default function CyclingDashboard() {
   const currentPosRef = useRef<{ lat: number; lng: number }>({ lat: 35.6600, lng: 139.3900 });
   const lastDetectionTimeRef = useRef<number>(0);
   const wakeLockRef = useRef<any>(null);
+  const motionListenerRef = useRef<((e: DeviceMotionEvent) => void) | null>(null);
 
   const allBumpsRef = useRef<BumpPoint[]>([]);
   allBumpsRef.current = allBumps;
@@ -100,7 +101,6 @@ export default function CyclingDashboard() {
     return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
   };
 
-  // 画面スリープ防止
   const requestWakeLock = async () => {
     if ("wakeLock" in navigator) {
       try {
@@ -118,7 +118,7 @@ export default function CyclingDashboard() {
     }
   };
 
-  // ローカルストレージ復元 ＆ リログ保護
+  // 1. ローカルストレージ復元
   useEffect(() => {
     const savedBumps = localStorage.getItem("velo_accumulated_bumps");
     if (savedBumps) {
@@ -138,8 +138,7 @@ export default function CyclingDashboard() {
             setCurrentRoute(backup.route);
             setTotalDistanceKm(backup.distanceKm || 0);
             setElapsedSeconds(backup.elapsedSeconds || 0);
-            setIsRecording(true);
-            requestWakeLock();
+            startSensorsAndTracking();
           } else {
             localStorage.removeItem("velo_active_session_backup");
           }
@@ -160,12 +159,22 @@ export default function CyclingDashboard() {
     localStorage.setItem("velo_sessions_history", JSON.stringify(sessions));
   };
 
-  // 予備加速度センサー（バックグラウンド常時動作）
-  useEffect(() => {
-    if (!isRecording) return;
+  // 2. 加速度センサー開始（iOS許可要求を明示的に処理）
+  const startMotionSensor = async () => {
+    if (typeof (DeviceMotionEvent as any) !== "undefined" && typeof (DeviceMotionEvent as any).requestPermission === "function") {
+      try {
+        const permissionState = await (DeviceMotionEvent as any).requestPermission();
+        if (permissionState !== "granted") {
+          alert("加速度センサーの利用が許可されませんでした。設定からブラウザの動作と方向を許可してください。");
+          return;
+        }
+      } catch (e) {
+        console.error("DeviceMotion permission error:", e);
+      }
+    }
 
     const handleMotion = (e: DeviceMotionEvent) => {
-      const acc = e.accelerationIncludingGravity;
+      const acc = e.accelerationIncludingGravity || e.acceleration;
       if (!acc || acc.x === null || acc.y === null || acc.z === null) return;
 
       const g = Math.sqrt(acc.x ** 2 + acc.y ** 2 + acc.z ** 2) / 9.80665;
@@ -187,12 +196,6 @@ export default function CyclingDashboard() {
         const updated = [newBump, ...allBumpsRef.current];
         saveBumps(updated);
 
-        localStorage.setItem("velo_active_session_backup", JSON.stringify({
-          route: currentRouteRef.current,
-          distanceKm: totalDistanceKm,
-          elapsedSeconds: elapsedSeconds,
-        }));
-
         const flash = document.createElement("div");
         flash.className = "fixed inset-0 bg-amber-400/40 z-50 pointer-events-none transition-opacity duration-300";
         document.body.appendChild(flash);
@@ -203,13 +206,23 @@ export default function CyclingDashboard() {
       }
     };
 
+    if (motionListenerRef.current) {
+      window.removeEventListener("devicemotion", motionListenerRef.current);
+    }
+    motionListenerRef.current = handleMotion;
     window.addEventListener("devicemotion", handleMotion, { passive: true });
-    return () => window.removeEventListener("devicemotion", handleMotion);
-  }, [isRecording, thresholdG, totalDistanceKm, elapsedSeconds]);
+  };
 
-  // GPS位置情報追従（衛星ミリ秒タイムスタンプを即時ローカル永続化）
-  useEffect(() => {
-    if (!isRecording || !navigator.geolocation) return;
+  const stopMotionSensor = () => {
+    if (motionListenerRef.current) {
+      window.removeEventListener("devicemotion", motionListenerRef.current);
+      motionListenerRef.current = null;
+    }
+  };
+
+  // 3. GPS追従
+  const startGpsTracking = () => {
+    if (!navigator.geolocation) return;
 
     watchIdRef.current = navigator.geolocation.watchPosition(
       (pos) => {
@@ -255,16 +268,61 @@ export default function CyclingDashboard() {
       (err) => console.error("GPS Watch Error:", err),
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
+  };
 
-    return () => {
-      if (watchIdRef.current) {
-        navigator.geolocation.clearWatch(watchIdRef.current);
-        watchIdRef.current = null;
-      }
-    };
-  }, [isRecording, totalDistanceKm, elapsedSeconds]);
+  const startSensorsAndTracking = async () => {
+    setIsRecording(true);
+    requestWakeLock();
+    await startMotionSensor();
+    startGpsTracking();
+    if (!timerRef.current) {
+      timerRef.current = setInterval(() => setElapsedSeconds((s) => s + 1), 1000);
+    }
+  };
 
-  // 地図初期化（OpenStreetMap / DOM非破棄型）
+  const stopSensorsAndTracking = () => {
+    setIsRecording(false);
+    releaseWakeLock();
+    stopMotionSensor();
+    if (watchIdRef.current) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+
+    if (currentRoute.length > 0) {
+      const session: RideSession = {
+        id: `SESS_${formatDateTimeId(Date.now())}`,
+        title: rideTitle,
+        spotName,
+        bikeType,
+        startTime: currentRoute[0]?.time || Date.now(),
+        route: currentRoute,
+        bumps: allBumps.filter((b) => currentRoute.some((r) => Math.abs(r.time - b.timestamp) < 7200000)),
+        distanceKm: totalDistanceKm,
+      };
+      const updated = [session, ...allSessions];
+      saveSessions(updated);
+      localStorage.removeItem("velo_active_session_backup");
+    }
+  };
+
+  const toggleRecording = async () => {
+    if (!isRecording) {
+      setCurrentRoute([]);
+      setTotalDistanceKm(0);
+      setElapsedSeconds(0);
+      setMaxG(1.0);
+      await startSensorsAndTracking();
+    } else {
+      stopSensorsAndTracking();
+    }
+  };
+
+  // 4. 地図初期化
   useEffect(() => {
     const initMap = () => {
       if (!mapContainerRef.current || mapRef.current) return;
@@ -427,7 +485,6 @@ export default function CyclingDashboard() {
     reader.onload = (event) => {
       const dataUrl = event.target?.result as string;
       const dateStr = formatDateTimeId(targetBump.timestamp);
-      // M5Stackとミリ秒レベルで突合できるファイル名
       const fileName = `IMG_${dateStr}_${targetBump.timestamp}_${targetBump.impactG.toFixed(2)}G_${targetBump.lat.toFixed(5)}_${targetBump.lng.toFixed(5)}.jpg`;
 
       const a = document.createElement("a");
@@ -453,7 +510,6 @@ export default function CyclingDashboard() {
     if (mapRef.current) mapRef.current.closePopup();
   };
 
-  // M5Stack突合用 CSVエクスポート
   const downloadSessionCSV = (sess: RideSession) => {
     const routeHeader = "epoch_ms,iso_utc,lat,lng,speed_kmh\n";
     const routeBody = sess.route
@@ -489,39 +545,6 @@ export default function CyclingDashboard() {
     setEditingSessionId(null);
   };
 
-  // 計測開始/停止
-  const toggleRecording = () => {
-    if (!isRecording) {
-      setCurrentRoute([]);
-      setTotalDistanceKm(0);
-      setElapsedSeconds(0);
-      setMaxG(1.0);
-      setIsRecording(true);
-      requestWakeLock();
-      timerRef.current = setInterval(() => setElapsedSeconds((s) => s + 1), 1000);
-    } else {
-      setIsRecording(false);
-      releaseWakeLock();
-      if (timerRef.current) clearInterval(timerRef.current);
-
-      if (currentRoute.length > 0) {
-        const session: RideSession = {
-          id: `SESS_${formatDateTimeId(Date.now())}`,
-          title: rideTitle,
-          spotName,
-          bikeType,
-          startTime: currentRoute[0]?.time || Date.now(),
-          route: currentRoute,
-          bumps: allBumps.filter((b) => currentRoute.some((r) => Math.abs(r.time - b.timestamp) < 7200000)),
-          distanceKm: totalDistanceKm,
-        };
-        const updated = [session, ...allSessions];
-        saveSessions(updated);
-        localStorage.removeItem("velo_active_session_backup");
-      }
-    }
-  };
-
   const formatTime = (sec: number) => {
     const m = Math.floor(sec / 60);
     const s = sec % 60;
@@ -549,7 +572,7 @@ export default function CyclingDashboard() {
           <div className="flex items-center gap-2">
             <span className={`w-2.5 h-2.5 rounded-full ${isRecording ? "bg-red-500 animate-ping" : "bg-cyan-400"}`} />
             <span className="font-bold text-cyan-400">
-              {isRecording ? "LOGGING (WAKE-LOCK ON)" : "STANDBY"}
+              {isRecording ? "LOGGING (SENSOR ON)" : "STANDBY"}
             </span>
           </div>
           <div className="flex items-center gap-3 font-mono text-[11px]">
@@ -575,7 +598,7 @@ export default function CyclingDashboard() {
             </div>
           </div>
           <div className="text-center">
-            <div className="text-[10px] text-slate-400 font-bold tracking-wider">IMPACT G (BACKUP)</div>
+            <div className="text-[10px] text-slate-400 font-bold tracking-wider">IMPACT G (PHONE)</div>
             <div className="flex items-baseline justify-center gap-0.5 font-mono">
               <span className={`text-4xl font-black ${currentG >= thresholdG ? "text-amber-400 animate-bounce" : "text-slate-200"}`}>
                 {currentG.toFixed(2)}
@@ -596,7 +619,7 @@ export default function CyclingDashboard() {
             }`}
           >
             {isRecording ? <Square className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
-            {isRecording ? "計測停止 (保存)" : "計測スタート"}
+            {isRecording ? "計測停止 (保存)" : "計測スタート (センサー許可)"}
           </button>
 
           <button
@@ -679,7 +702,7 @@ export default function CyclingDashboard() {
           )}
         </div>
 
-        {/* ビュー 2: 未撮影 ＆ 写真ギャラリー */}
+        {/* ビュー 2: 未撮影 ＆ 写真 */}
         {activeView === "photos" && (
           <div className="h-full overflow-y-auto p-3 space-y-4">
             <div>
