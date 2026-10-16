@@ -28,6 +28,14 @@ import {
 const GOOGLE_API_KEY = "AIzaSyAYislWzcpW08gA9kDP19jL72UF0E_1h6Y";
 const DRIVE_FOLDER_ID = "1OyQd7HRAXA9FGUd-BAIP0j193wClvK5r";
 
+interface TrackPoint {
+  lat: number;
+  lng: number;
+  time: number;
+  speed: number;
+  impactG: number; // 予備センサー値（取れていなければ 0.00）
+}
+
 interface BumpPoint {
   id: string;
   lat: number;
@@ -44,7 +52,7 @@ interface RideSession {
   spotName: string;
   bikeType: string;
   startTime: number;
-  route: { lat: number; lng: number; time: number; speed: number }[];
+  route: TrackPoint[];
   bumps: BumpPoint[];
   distanceKm: number;
 }
@@ -55,19 +63,19 @@ export default function CyclingDashboard() {
 
   // リアルタイム指標
   const [currentSpeed, setCurrentSpeed] = useState(0);
-  const [currentG, setCurrentG] = useState(1.0);
-  const [maxG, setMaxG] = useState(1.0);
+  const [currentG, setCurrentG] = useState(0.0); // 未取得時は 0.0
+  const [maxG, setMaxG] = useState(0.0);
   const [totalDistanceKm, setTotalDistanceKm] = useState(0);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
   // メタデータ
-  const [rideTitle, setRideTitle] = useState("多摩サイ〜浅川 実走調査");
-  const [spotName, setSpotName] = useState("日野〜府中・浅川合流点");
+  const [rideTitle, setRideTitle] = useState("自宅-大学");
+  const [spotName, setSpotName] = useState("日野");
   const [bikeType, setBikeType] = useState("ロードバイク (700x28c)");
 
   // データ管理
   const [allBumps, setAllBumps] = useState<BumpPoint[]>([]);
-  const [currentRoute, setCurrentRoute] = useState<{ lat: number; lng: number; time: number; speed: number }[]>([]);
+  const [currentRoute, setCurrentRoute] = useState<TrackPoint[]>([]);
   const [allSessions, setAllSessions] = useState<RideSession[]>([]);
   const [nearbyBump, setNearbyBump] = useState<BumpPoint | null>(null);
 
@@ -95,14 +103,15 @@ export default function CyclingDashboard() {
 
   const watchIdRef = useRef<number | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
-  const currentPosRef = useRef<{ lat: number; lng: number }>({ lat: 35.6600, lng: 139.3900 });
+  const currentPosRef = useRef<{ lat: number; lng: number }>({ lat: 35.6561, lng: 139.4378 });
+  const currentGRef = useRef<number>(0.0);
   const lastDetectionTimeRef = useRef<number>(0);
   const wakeLockRef = useRef<any>(null);
   const motionListenerRef = useRef<((e: DeviceMotionEvent) => void) | null>(null);
 
   const allBumpsRef = useRef<BumpPoint[]>([]);
   allBumpsRef.current = allBumps;
-  const currentRouteRef = useRef<{ lat: number; lng: number; time: number; speed: number }[]>([]);
+  const currentRouteRef = useRef<TrackPoint[]>([]);
   currentRouteRef.current = currentRoute;
 
   const formatDateTimeId = (ts: number) => {
@@ -164,12 +173,19 @@ export default function CyclingDashboard() {
     localStorage.setItem("velo_accumulated_bumps", JSON.stringify(bumps));
   };
 
+  const clearAllBumps = () => {
+    if (confirm("登録されているすべての段差ピンを消去しますか？")) {
+      saveBumps([]);
+      setNearbyBump(null);
+    }
+  };
+
   const saveSessions = (sessions: RideSession[]) => {
     setAllSessions(sessions);
     localStorage.setItem("velo_sessions_history", JSON.stringify(sessions));
   };
 
-  // 2. Google Drive からの柔軟なインポート（朝のGPS座標ログもM5ログも両方救済）
+  // 2. Google Drive からのインポート（TRACK_LOGとBUMP_LOGを正しく分離・空値は0）
   const fetchAndSyncFromGoogleDrive = async () => {
     setIsSyncingDrive(true);
     setSyncStatusMsg("Googleドライブ内を検索中...");
@@ -184,14 +200,12 @@ export default function CyclingDashboard() {
       const listData = await listRes.json();
       const files: any[] = listData.files || [];
 
-      // ドライブ内のすべての CSV ファイルを対象にする
       const csvFiles = files.filter((f) => f.name.toLowerCase().endsWith(".csv"));
       if (csvFiles.length === 0) {
         setSyncStatusMsg("ドライブ内にCSVファイルが見つかりませんでした。");
         return;
       }
 
-      // 最新のCSVを取得
       const targetFile = csvFiles[0];
       setSyncStatusMsg(`${targetFile.name} を解析中...`);
 
@@ -200,96 +214,123 @@ export default function CyclingDashboard() {
       if (!fileRes.ok) throw new Error("CSV本文の取得に失敗しました。");
       const csvText = await fileRes.text();
 
-      // セクション分割（[TRACK_LOG] や [BUMP_LOG] が入っている独自形式にも対応）
       const lines = csvText.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
       if (lines.length <= 1) {
         setSyncStatusMsg("CSVに有効なデータがありません。");
         return;
       }
 
-      // ヘッダー行を探す（[TRACK_LOG] などのタグをスキップ）
-      let headerIdx = 0;
-      while (headerIdx < lines.length && (lines[headerIdx].startsWith("[") || !lines[headerIdx].includes(","))) {
-        headerIdx++;
-      }
-
-      const headers = lines[headerIdx].split(",").map((h) => h.trim().toLowerCase());
-      
-      // カラム位置を柔軟に特定
-      const latIdx = headers.findIndex((h) => h === "lat" || h === "latitude");
-      const lngIdx = headers.findIndex((h) => h === "lng" || h === "longitude" || h === "lon");
-      const timeIdx = headers.findIndex((h) => h === "epoch_ms" || h === "time" || h === "timestamp");
-      const impactIdx = headers.findIndex((h) => h === "impact_g" || h === "impactg" || h === "g");
-      const idIdx = headers.findIndex((h) => h === "bump_id" || h === "id");
-
-      let loadedBumpsCount = 0;
+      const loadedRoute: TrackPoint[] = [];
       const loadedBumps: BumpPoint[] = [];
-      const loadedRoute: { lat: number; lng: number; time: number; speed: number }[] = [];
 
-      for (let i = headerIdx + 1; i < lines.length; i++) {
-        const line = lines[i];
-        if (line.startsWith("[")) continue; // セクションヘッダーはスキップ
+      const hasSections = lines.some((l) => l.startsWith("[") && l.endsWith("]"));
 
-        const cols = line.split(",").map((c) => c.trim());
-        if (cols.length < 2) continue;
+      if (hasSections) {
+        let curSection = "";
+        const sectionMap: Record<string, string[]> = {};
 
-        const rawLat = latIdx !== -1 ? parseFloat(cols[latIdx]) : NaN;
-        const rawLng = lngIdx !== -1 ? parseFloat(cols[lngIdx]) : NaN;
-        const rawTime = timeIdx !== -1 ? parseInt(cols[timeIdx], 10) : Date.now();
-        const rawG = impactIdx !== -1 ? parseFloat(cols[impactIdx]) : 2.5; // G値列がない朝のログなら閾値以上として扱う
-        const rawId = idIdx !== -1 ? cols[idIdx] : `BUMP_${formatDateTimeId(isNaN(rawTime) ? Date.now() : rawTime)}_${i}`;
-
-        // 1. 座標が生きているデータの場合（朝のログ）
-        if (!isNaN(rawLat) && !isNaN(rawLng) && rawLat !== 0 && rawLng !== 0) {
-          loadedRoute.push({
-            lat: rawLat,
-            lng: rawLng,
-            time: isNaN(rawTime) ? Date.now() : rawTime,
-            speed: 0,
-          });
-
-          // G値が存在して閾値以上、または明示的な段差レコードならピンに追加
-          if (rawG >= thresholdG || impactIdx === -1) {
-            loadedBumps.push({
-              id: rawId,
-              lat: rawLat,
-              lng: rawLng,
-              impactG: isNaN(rawG) ? 2.5 : rawG,
-              timestamp: isNaN(rawTime) ? Date.now() : rawTime,
-            });
-            loadedBumpsCount++;
+        for (const line of lines) {
+          if (line.startsWith("[") && line.endsWith("]")) {
+            curSection = line.slice(1, -1).trim();
+            sectionMap[curSection] = [];
+          } else if (curSection) {
+            sectionMap[curSection].push(line);
           }
         }
-        // 2. 座標がなくM5側のタイムスタンプ＋G値のみのデータの場合
-        else if (rawG >= thresholdG && !isNaN(rawTime)) {
-          // 既存の走行ルートから時刻突合
-          let matchedLat = currentPosRef.current.lat;
-          let matchedLng = currentPosRef.current.lng;
 
-          if (currentRouteRef.current.length > 0) {
-            let minDiff = Infinity;
-            for (const r of currentRouteRef.current) {
-              const diff = Math.abs(r.time - rawTime);
-              if (diff < minDiff) {
-                minDiff = diff;
-                matchedLat = r.lat;
-                matchedLng = r.lng;
-              }
+        // 1. TRACK_LOG: 軌跡のみ（空値は 0）
+        if (sectionMap["TRACK_LOG"] && sectionMap["TRACK_LOG"].length > 1) {
+          const tHeaders = sectionMap["TRACK_LOG"][0].split(",").map((h) => h.trim().toLowerCase());
+          const latIdx = tHeaders.indexOf("lat");
+          const lngIdx = tHeaders.indexOf("lng");
+          const timeIdx = tHeaders.indexOf("epoch_ms");
+          const spdIdx = tHeaders.indexOf("speed_kmh");
+          const gIdx = tHeaders.indexOf("impact_g");
+
+          for (let i = 1; i < sectionMap["TRACK_LOG"].length; i++) {
+            const cols = sectionMap["TRACK_LOG"][i].split(",").map((c) => c.trim());
+            const lat = parseFloat(cols[latIdx]);
+            const lng = parseFloat(cols[lngIdx]);
+            if (!isNaN(lat) && !isNaN(lng)) {
+              loadedRoute.push({
+                lat,
+                lng,
+                time: timeIdx !== -1 && !isNaN(parseInt(cols[timeIdx], 10)) ? parseInt(cols[timeIdx], 10) : 0,
+                speed: spdIdx !== -1 && !isNaN(parseFloat(cols[spdIdx])) ? parseFloat(cols[spdIdx]) : 0,
+                impactG: gIdx !== -1 && !isNaN(parseFloat(cols[gIdx])) ? parseFloat(cols[gIdx]) : 0,
+              });
             }
           }
+        }
 
-          loadedBumps.push({
-            id: `M5_${formatDateTimeId(rawTime)}`,
-            lat: matchedLat,
-            lng: matchedLng,
-            impactG: rawG,
-            timestamp: rawTime,
-          });
-          loadedBumpsCount++;
+        // 2. BUMP_LOG: 段差のみ
+        if (sectionMap["BUMP_LOG"] && sectionMap["BUMP_LOG"].length > 1) {
+          const bHeaders = sectionMap["BUMP_LOG"][0].split(",").map((h) => h.trim().toLowerCase());
+          const idIdx = bHeaders.indexOf("bump_id");
+          const latIdx = bHeaders.indexOf("lat");
+          const lngIdx = bHeaders.indexOf("lng");
+          const timeIdx = bHeaders.indexOf("epoch_ms");
+          const gIdx = bHeaders.indexOf("impact_g");
+          const photoIdx = bHeaders.indexOf("photo_filename");
+
+          for (let i = 1; i < sectionMap["BUMP_LOG"].length; i++) {
+            const cols = sectionMap["BUMP_LOG"][i].split(",").map((c) => c.trim());
+            const lat = parseFloat(cols[latIdx]);
+            const lng = parseFloat(cols[lngIdx]);
+            const g = parseFloat(cols[gIdx]);
+            const ts = timeIdx !== -1 && !isNaN(parseInt(cols[timeIdx], 10)) ? parseInt(cols[timeIdx], 10) : 0;
+            const photoFileName = (photoIdx !== -1 && cols[photoIdx] !== "NONE") ? cols[photoIdx] : undefined;
+
+            if (!isNaN(lat) && !isNaN(lng) && !isNaN(g)) {
+              loadedBumps.push({
+                id: idIdx !== -1 && cols[idIdx] ? cols[idIdx] : `BUMP_${formatDateTimeId(ts || Date.now())}`,
+                lat,
+                lng,
+                impactG: g,
+                timestamp: ts,
+                photoFileName,
+              });
+            }
+          }
+        }
+      } else {
+        // M5Stack CSV形式の場合
+        const headers = lines[0].split(",").map((h) => h.trim().toLowerCase());
+        const epochIdx = headers.indexOf("epoch_ms");
+        const impactIdx = headers.indexOf("impact_g");
+
+        for (let i = 1; i < lines.length; i++) {
+          const cols = lines[i].split(",").map((c) => c.trim());
+          const gVal = impactIdx !== -1 ? parseFloat(cols[impactIdx]) : 0;
+          const ts = epochIdx !== -1 ? parseInt(cols[epochIdx], 10) : 0;
+
+          if (gVal >= thresholdG && ts > 0) {
+            let matchedLat = currentPosRef.current.lat;
+            let matchedLng = currentPosRef.current.lng;
+
+            if (currentRouteRef.current.length > 0) {
+              let minDiff = Infinity;
+              for (const r of currentRouteRef.current) {
+                const diff = Math.abs(r.time - ts);
+                if (diff < minDiff) {
+                  minDiff = diff;
+                  matchedLat = r.lat;
+                  matchedLng = r.lng;
+                }
+              }
+            }
+
+            loadedBumps.push({
+              id: `M5_${formatDateTimeId(ts)}`,
+              lat: matchedLat,
+              lng: matchedLng,
+              impactG: gVal,
+              timestamp: ts,
+            });
+          }
         }
       }
 
-      // 既存データとマージして保存
       if (loadedRoute.length > 0) {
         setCurrentRoute((prev) => [...prev, ...loadedRoute]);
       }
@@ -301,7 +342,7 @@ export default function CyclingDashboard() {
         saveBumps([...freshBumps, ...allBumps]);
       }
 
-      setSyncStatusMsg(`同期成功: ${targetFile.name} (座標点: ${loadedRoute.length}件, 段差: ${loadedBumpsCount}件を復元)`);
+      setSyncStatusMsg(`同期成功: ${targetFile.name} (軌跡点: ${loadedRoute.length}点, 段差: ${loadedBumps.length}件)`);
     } catch (err: any) {
       console.error("Drive Sync Error:", err);
       setSyncStatusMsg(`同期エラー: ${err.message}`);
@@ -310,25 +351,34 @@ export default function CyclingDashboard() {
     }
   };
 
-  // 3. 加速度センサー開始（予備用・iOS Safari許可明示）
+  // 3. 加速度センサー開始（予備用・何も取れなければ 0.0）
   const startMotionSensor = async () => {
     if (typeof (DeviceMotionEvent as any) !== "undefined" && typeof (DeviceMotionEvent as any).requestPermission === "function") {
       try {
         const permissionState = await (DeviceMotionEvent as any).requestPermission();
         if (permissionState !== "granted") {
-          alert("加速度センサーの利用が許可されませんでした。");
+          currentGRef.current = 0.0;
+          setCurrentG(0.0);
           return;
         }
       } catch (e) {
         console.error("DeviceMotion permission error:", e);
+        currentGRef.current = 0.0;
+        setCurrentG(0.0);
+        return;
       }
     }
 
     const handleMotion = (e: DeviceMotionEvent) => {
       const acc = e.accelerationIncludingGravity || e.acceleration;
-      if (!acc || acc.x === null || acc.y === null || acc.z === null) return;
+      if (!acc || acc.x === null || acc.y === null || acc.z === null) {
+        currentGRef.current = 0.0;
+        setCurrentG(0.0);
+        return;
+      }
 
       const g = Math.sqrt(acc.x ** 2 + acc.y ** 2 + acc.z ** 2) / 9.80665;
+      currentGRef.current = g;
       setCurrentG(g);
       setMaxG((prev) => Math.max(prev, g));
 
@@ -369,9 +419,11 @@ export default function CyclingDashboard() {
       window.removeEventListener("devicemotion", motionListenerRef.current);
       motionListenerRef.current = null;
     }
+    currentGRef.current = 0.0;
+    setCurrentG(0.0);
   };
 
-  // 4. GPS追従
+  // 4. GPS追従（予備G値も含めてTrackPointに蓄積、無ければ 0.0）
   const startGpsTracking = () => {
     if (!navigator.geolocation) return;
 
@@ -405,7 +457,10 @@ export default function CyclingDashboard() {
         }
         setNearbyBump(found);
 
-        const newPoint = { ...p, time: gpsTime, speed: spd };
+        // 予備G値が入っていれば記録、無ければ 0.00
+        const pointG = currentGRef.current > 0 ? parseFloat(currentGRef.current.toFixed(2)) : 0.0;
+        const newPoint: TrackPoint = { ...p, time: gpsTime, speed: spd, impactG: pointG };
+
         setCurrentRoute((prev) => {
           const next = [...prev, newPoint];
           localStorage.setItem("velo_active_session_backup", JSON.stringify({
@@ -466,7 +521,7 @@ export default function CyclingDashboard() {
       setCurrentRoute([]);
       setTotalDistanceKm(0);
       setElapsedSeconds(0);
-      setMaxG(1.0);
+      setMaxG(0.0);
       await startSensorsAndTracking();
     } else {
       stopSensorsAndTracking();
@@ -620,7 +675,7 @@ export default function CyclingDashboard() {
         id: `BUMP_${formatDateTimeId(now)}`,
         lat: currentPosRef.current.lat,
         lng: currentPosRef.current.lng,
-        impactG: currentG,
+        impactG: currentGRef.current > 0 ? currentGRef.current : 0.0,
         timestamp: now,
       };
       saveBumps([newBump, ...allBumps]);
@@ -661,15 +716,16 @@ export default function CyclingDashboard() {
     if (mapRef.current) mapRef.current.closePopup();
   };
 
+  // CSVエクスポート: 欠損値は 0.00 を明示
   const downloadSessionCSV = (sess: RideSession) => {
-    const routeHeader = "epoch_ms,iso_utc,lat,lng,speed_kmh\n";
+    const routeHeader = "epoch_ms,iso_utc,lat,lng,speed_kmh,impact_g\n";
     const routeBody = sess.route
-      .map((r) => `${r.time},${new Date(r.time).toISOString()},${r.lat},${r.lng},${r.speed.toFixed(2)}`)
+      .map((r) => `${r.time},${r.time > 0 ? new Date(r.time).toISOString() : ""},${r.lat},${r.lng},${(r.speed || 0).toFixed(2)},${(r.impactG || 0).toFixed(2)}`)
       .join("\n");
 
     const bumpHeader = "bump_id,epoch_ms,iso_utc,lat,lng,impact_g,status,photo_filename\n";
     const bumpBody = sess.bumps
-      .map((b) => `${b.id},${b.timestamp},${new Date(b.timestamp).toISOString()},${b.lat},${b.lng},${b.impactG.toFixed(3)},${b.photoUrl ? "SAVED" : "UNPHOTOGRAPHED"},${b.photoFileName || "NONE"}`)
+      .map((b) => `${b.id},${b.timestamp},${b.timestamp > 0 ? new Date(b.timestamp).toISOString() : ""},${b.lat},${b.lng},${(b.impactG || 0).toFixed(3)},${b.photoUrl ? "SAVED" : "UNPHOTOGRAPHED"},${b.photoFileName || "NONE"}`)
       .join("\n");
 
     const fullContent = `# VeloTelemetry Session Export\n# Title: ${sess.title}\n# Spot: ${sess.spotName}\n# Bike: ${sess.bikeType}\n# DistanceKm: ${sess.distanceKm.toFixed(2)}\n\n[TRACK_LOG]\n${routeHeader}${routeBody}\n\n[BUMP_LOG]\n${bumpHeader}${bumpBody}`;
@@ -723,7 +779,7 @@ export default function CyclingDashboard() {
           <div className="flex items-center gap-2">
             <span className={`w-2.5 h-2.5 rounded-full ${isRecording ? "bg-red-500 animate-ping" : "bg-cyan-400"}`} />
             <span className="font-bold text-cyan-400">
-              {isRecording ? "LOGGING (SENSOR ON)" : "STANDBY"}
+              {isRecording ? "LOGGING (STANDBY ON)" : "STANDBY"}
             </span>
           </div>
           <div className="flex items-center gap-3 font-mono text-[11px]">
@@ -749,7 +805,7 @@ export default function CyclingDashboard() {
             </div>
           </div>
           <div className="text-center">
-            <div className="text-[10px] text-slate-400 font-bold tracking-wider">IMPACT G (PHONE)</div>
+            <div className="text-[10px] text-slate-400 font-bold tracking-wider">BACKUP G (PHONE)</div>
             <div className="flex items-baseline justify-center gap-0.5 font-mono">
               <span className={`text-4xl font-black ${currentG >= thresholdG ? "text-amber-400 animate-bounce" : "text-slate-200"}`}>
                 {currentG.toFixed(2)}
@@ -770,7 +826,7 @@ export default function CyclingDashboard() {
             }`}
           >
             {isRecording ? <Square className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
-            {isRecording ? "計測停止 (保存)" : "計測スタート (センサー許可)"}
+            {isRecording ? "計測停止 (保存)" : "計測スタート"}
           </button>
 
           <button
@@ -856,41 +912,50 @@ export default function CyclingDashboard() {
         {/* ビュー 2: 未撮影 ＆ 写真 */}
         {activeView === "photos" && (
           <div className="h-full overflow-y-auto p-3 space-y-4">
-            <div>
-              <h3 className="text-xs font-bold text-amber-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+            <div className="flex justify-between items-center">
+              <h3 className="text-xs font-bold text-amber-400 uppercase tracking-wider flex items-center gap-1.5">
                 <AlertTriangle className="w-4 h-4" /> 撮影待ち段差 ({unphotographedBumps.length}地点)
               </h3>
-              {unphotographedBumps.length === 0 ? (
-                <div className="text-xs text-slate-500 bg-slate-900 border border-slate-800 p-3 rounded-xl text-center">
-                  未撮影の段差はありません
-                </div>
-              ) : (
-                <div className="space-y-1.5 max-h-48 overflow-y-auto">
-                  {unphotographedBumps.map((b) => (
-                    <div key={b.id} className="p-2.5 bg-slate-900 border border-slate-800 rounded-xl flex items-center justify-between text-xs">
-                      <div>
-                        <div className="font-mono text-cyan-300 font-bold">{b.impactG.toFixed(2)}G</div>
-                        <div className="text-[10px] text-slate-400">{new Date(b.timestamp).toLocaleTimeString()} ({b.lat.toFixed(4)}, {b.lng.toFixed(4)})</div>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => triggerCameraForBump(b)}
-                          className="px-2.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-xs font-bold flex items-center gap-1"
-                        >
-                          <Camera className="w-3.5 h-3.5" /> 撮影
-                        </button>
-                        <button
-                          onClick={() => deleteBump(b.id)}
-                          className="p-1.5 bg-red-950 text-red-400 rounded-lg hover:bg-red-900"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
+              {allBumps.length > 0 && (
+                <button
+                  onClick={clearAllBumps}
+                  className="text-[10px] bg-red-950/60 hover:bg-red-900 text-red-400 border border-red-900 px-2 py-1 rounded-lg flex items-center gap-1"
+                >
+                  <Trash2 className="w-3 h-3" /> 段差ピン全消去
+                </button>
               )}
             </div>
+
+            {unphotographedBumps.length === 0 ? (
+              <div className="text-xs text-slate-500 bg-slate-900 border border-slate-800 p-3 rounded-xl text-center">
+                未撮影の段差はありません
+              </div>
+            ) : (
+              <div className="space-y-1.5 max-h-56 overflow-y-auto">
+                {unphotographedBumps.map((b) => (
+                  <div key={b.id} className="p-2.5 bg-slate-900 border border-slate-800 rounded-xl flex items-center justify-between text-xs">
+                    <div>
+                      <div className="font-mono text-cyan-300 font-bold">{b.impactG.toFixed(2)}G</div>
+                      <div className="text-[10px] text-slate-400">{b.timestamp > 0 ? new Date(b.timestamp).toLocaleTimeString() : "-"} ({b.lat.toFixed(4)}, {b.lng.toFixed(4)})</div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => triggerCameraForBump(b)}
+                        className="px-2.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-xs font-bold flex items-center gap-1"
+                      >
+                        <Camera className="w-3.5 h-3.5" /> 撮影
+                      </button>
+                      <button
+                        onClick={() => deleteBump(b.id)}
+                        className="p-1.5 bg-red-950 text-red-400 rounded-lg hover:bg-red-900"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
 
             <div>
               <h3 className="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
@@ -908,7 +973,7 @@ export default function CyclingDashboard() {
                       <div className="p-2 space-y-0.5">
                         <div className="text-[10px] font-bold text-emerald-400 flex items-center justify-between">
                           <span>{bump.impactG.toFixed(2)}G</span>
-                          <span className="text-slate-500 font-mono text-[9px]">{new Date(bump.timestamp).toLocaleDateString()}</span>
+                          <span className="text-slate-500 font-mono text-[9px]">{bump.timestamp > 0 ? new Date(bump.timestamp).toLocaleDateString() : ""}</span>
                         </div>
                         <div className="text-[9px] text-slate-400 font-mono truncate">{bump.photoFileName}</div>
                       </div>
@@ -931,7 +996,6 @@ export default function CyclingDashboard() {
         {activeView === "sessions" && (
           <div className="h-full overflow-y-auto p-3 space-y-3">
             
-            {/* Google Drive 同期コントロールパネル */}
             <div className="bg-slate-900 border border-cyan-800/60 rounded-2xl p-3 shadow-lg">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-bold text-cyan-300 flex items-center gap-1.5">
