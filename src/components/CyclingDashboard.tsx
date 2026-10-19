@@ -91,7 +91,7 @@ export default function CyclingDashboard() {
   // データ管理
   const [allBumps, setAllBumps] = useState<BumpPoint[]>([]);
   const [currentRoute, setCurrentRoute] = useState<TrackPoint[]>([]);
-  const [syncedRoute, setSyncedRoute] = useState<TrackPoint[]>([]); // ドライブ同期専用の独立軌跡
+  const [syncedRoute, setSyncedRoute] = useState<TrackPoint[]>([]);
   const [allSessions, setAllSessions] = useState<RideSession[]>([]);
   const [nearbyBump, setNearbyBump] = useState<BumpPoint | null>(null);
 
@@ -125,7 +125,6 @@ export default function CyclingDashboard() {
   const currentPosRef = useRef<{ lat: number; lng: number }>({ lat: 35.6561, lng: 139.4378 });
   const currentGRef = useRef<number>(0.0);
   const currentVolRef = useRef<number>(0);
-  const currentAccRef = useRef<number>(0);
   const lastDetectionTimeRef = useRef<number>(0);
   const lastRecordedPosRef = useRef<{ lat: number; lng: number; time: number } | null>(null);
   const wakeLockRef = useRef<any>(null);
@@ -165,7 +164,6 @@ export default function CyclingDashboard() {
     }
   };
 
-  // 1. ローカルストレージ復元
   useEffect(() => {
     const savedBumps = localStorage.getItem("velo_accumulated_bumps");
     if (savedBumps) {
@@ -194,7 +192,7 @@ export default function CyclingDashboard() {
     localStorage.setItem("velo_sessions_history", JSON.stringify(sessions));
   };
 
-  // 2. Google Drive からの同期（過去軌跡は syncedRoute に格納）
+  // Google Drive 同期
   const fetchAndSyncFromGoogleDrive = async () => {
     setIsSyncingDrive(true);
     setSyncStatusMsg("Googleドライブ内を検索中...");
@@ -306,7 +304,6 @@ export default function CyclingDashboard() {
         }
       }
 
-      // 同期軌跡をセット（現在の計測中ルートとは分離）
       if (loadedRoute.length > 0) {
         setSyncedRoute(loadedRoute);
         if (mapRef.current && loadedRoute[0]) {
@@ -330,7 +327,7 @@ export default function CyclingDashboard() {
     }
   };
 
-  // 3. 予備マイク音量取得 (Web Audio API)
+  // 予備マイク音量取得 (Web Audio API)
   const startAudioRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -381,7 +378,7 @@ export default function CyclingDashboard() {
     setCurrentVolume(0);
   };
 
-  // 4. 重力分離付き加速度センサー開始
+  // 重力分離付き加速度センサー開始
   const startMotionSensor = async () => {
     if (typeof (DeviceMotionEvent as any) !== "undefined" && typeof (DeviceMotionEvent as any).requestPermission === "function") {
       try {
@@ -398,16 +395,13 @@ export default function CyclingDashboard() {
     }
 
     const handleMotion = (e: DeviceMotionEvent) => {
-      // 重力除去加速度 (acceleration) を優先使用。無ければ重力込み (accelerationIncludingGravity)
       const pureAcc = e.acceleration;
       const rawAcc = e.accelerationIncludingGravity;
 
       let g = 0.0;
       if (pureAcc && pureAcc.x !== null && pureAcc.y !== null && pureAcc.z !== null) {
-        // 重力を除いた正味の衝撃G (静止時 0G)
         g = Math.sqrt(pureAcc.x ** 2 + pureAcc.y ** 2 + pureAcc.z ** 2) / 9.80665;
       } else if (rawAcc && rawAcc.x !== null && rawAcc.y !== null && rawAcc.z !== null) {
-        // 重力込みの場合は 1.0G を引いて補正
         const totalG = Math.sqrt(rawAcc.x ** 2 + rawAcc.y ** 2 + rawAcc.z ** 2) / 9.80665;
         g = Math.max(0, Math.abs(totalG - 1.0));
       }
@@ -457,7 +451,7 @@ export default function CyclingDashboard() {
     setCurrentG(0.0);
   };
 
-  // 5. GPS追従 (間引き・精度取得・距離積算)
+  // GPS追従 (間引き・精度・距離積算)
   const startGpsTracking = () => {
     if (!navigator.geolocation) return;
 
@@ -471,7 +465,6 @@ export default function CyclingDashboard() {
 
         setCurrentSpeed(spd);
         setGpsAccuracy(Math.round(acc));
-        currentAccRef.current = acc;
         currentPosRef.current = { lat, lng };
 
         if (userMarkerRef.current) {
@@ -481,15 +474,14 @@ export default function CyclingDashboard() {
           mapRef.current.panTo([lat, lng], { animate: true });
         }
 
-        // 間引き処理: 直前点から 0.5 秒以上、または 1.5m 以上移動した場合のみ記録
+        // 間引き処理 (同一ミリ秒や1m未満の微動をフィルタリング)
         const last = lastRecordedPosRef.current;
         if (last) {
           const dM = calcDistanceM(last.lat, last.lng, lat, lng);
           const dtS = (gpsTime - last.time) / 1000;
           if (dM < 1.0 && dtS < 0.8) {
-            return; // 重複・滞留データを間引く
+            return;
           }
-          // 正確な距離積算 (km)
           if (dM >= 1.0 && acc <= 30) {
             const addedKm = dM / 1000;
             setTotalDistanceKm((prev) => prev + addedKm);
@@ -498,7 +490,6 @@ export default function CyclingDashboard() {
 
         lastRecordedPosRef.current = { lat, lng, time: gpsTime };
 
-        // 近傍段差の接近判定
         const unphotographed = allBumpsRef.current.filter((b) => !b.photoUrl);
         let found: BumpPoint | null = null;
         for (const b of unphotographed) {
@@ -571,7 +562,6 @@ export default function CyclingDashboard() {
 
   const toggleRecording = async () => {
     if (!isRecording) {
-      // 走行開始: 現在の新規ルートのみリセット（同期された syncedRoute は保持）
       setCurrentRoute([]);
       setTotalDistanceKm(0);
       setElapsedSeconds(0);
@@ -582,7 +572,7 @@ export default function CyclingDashboard() {
     }
   };
 
-  // 6. 地図初期化
+  // 地図初期化
   useEffect(() => {
     const initMap = () => {
       if (!mapContainerRef.current || mapRef.current) return;
@@ -636,7 +626,6 @@ export default function CyclingDashboard() {
     const L = (window as any).L;
     if (!L) return;
 
-    // 1. 同期された過去軌跡 (シアンの破線)
     if (syncedRouteLayerRef.current) {
       syncedRouteLayerRef.current.clearLayers();
       if (syncedRoute.length > 1) {
@@ -649,7 +638,6 @@ export default function CyclingDashboard() {
       }
     }
 
-    // 2. 現在記録中のリアルタイム軌跡 (赤の実線)
     if (liveRouteLayerRef.current) {
       liveRouteLayerRef.current.clearLayers();
       if (currentRoute.length > 1) {
@@ -661,7 +649,6 @@ export default function CyclingDashboard() {
       }
     }
 
-    // 3. 段差ピン
     if (bumpsLayerRef.current) {
       bumpsLayerRef.current.clearLayers();
       allBumps.forEach((bump) => {
@@ -769,7 +756,7 @@ export default function CyclingDashboard() {
     if (mapRef.current) mapRef.current.closePopup();
   };
 
-  // CSVエクスポート: accuracy_m, volume 列を正式収録
+  // CSVエクスポート
   const downloadSessionCSV = (sess: RideSession) => {
     const routeHeader = "epoch_ms,iso_utc,lat,lng,speed_kmh,impact_g,accuracy_m,volume\n";
     const routeBody = sess.route
@@ -851,7 +838,6 @@ export default function CyclingDashboard() {
         </div>
 
         <div className="grid grid-cols-3 gap-1.5 items-center py-2">
-          {/* SPEED */}
           <div className="text-center border-r border-slate-800/80">
             <div className="text-[9px] text-slate-400 font-bold tracking-wider">SPEED</div>
             <div className="flex items-baseline justify-center gap-0.5 font-mono">
@@ -859,7 +845,6 @@ export default function CyclingDashboard() {
               <span className="text-[10px] text-slate-500 font-bold">km/h</span>
             </div>
           </div>
-          {/* PHONE G */}
           <div className="text-center border-r border-slate-800/80">
             <div className="text-[9px] text-slate-400 font-bold tracking-wider">IMPACT G</div>
             <div className="flex items-baseline justify-center gap-0.5 font-mono">
@@ -870,7 +855,6 @@ export default function CyclingDashboard() {
             </div>
             <div className="text-[9px] text-slate-500">MAX: {maxG.toFixed(2)}G</div>
           </div>
-          {/* MIC LEVEL */}
           <div className="text-center">
             <div className="text-[9px] text-slate-400 font-bold tracking-wider flex items-center justify-center gap-1">
               <Mic className="w-2.5 h-2.5 text-cyan-400" /> MIC VOL
