@@ -24,7 +24,8 @@ import {
   Database,
   Mic,
   Layers,
-  FileSpreadsheet
+  FileSpreadsheet,
+  Mountain
 } from "lucide-react";
 
 const GOOGLE_API_KEY = "AIzaSyAYislWzcpW08gA9kDP19jL72UF0E_1h6Y";
@@ -37,17 +38,23 @@ interface TrackPoint {
   speed: number;
   impactG: number;
   accuracy: number;
+  altitude: number;
+  altitudeAccuracy: number;
+  heading: number;
+  slopePct: number;
   volume: number;
   m5Ax?: number;
   m5Ay?: number;
   m5Az?: number;
   m5ImpactG?: number;
+  m5Volume?: number;
 }
 
 interface BumpPoint {
   id: string;
   lat: number;
   lng: number;
+  altitude: number;
   impactG: number;
   timestamp: number;
   photoUrl?: string;
@@ -72,6 +79,7 @@ interface RideSession {
   route: TrackPoint[];
   bumps: BumpPoint[];
   distanceKm: number;
+  elevationGainM: number;
   hasM5Merged?: boolean;
 }
 
@@ -93,9 +101,12 @@ export default function CyclingDashboard() {
   const [currentSpeed, setCurrentSpeed] = useState(0);
   const [currentG, setCurrentG] = useState(0.0);
   const [maxG, setMaxG] = useState(0.0);
+  const [currentAltitude, setCurrentAltitude] = useState(0);
+  const [currentSlope, setCurrentSlope] = useState(0);
   const [currentVolume, setCurrentVolume] = useState(0);
   const [gpsAccuracy, setGpsAccuracy] = useState(0);
   const [totalDistanceKm, setTotalDistanceKm] = useState(0);
+  const [elevationGain, setElevationGain] = useState(0);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
   // メタデータ
@@ -115,8 +126,8 @@ export default function CyclingDashboard() {
   const [isSyncingDrive, setIsSyncingDrive] = useState(false);
   const [syncStatusMsg, setSyncStatusMsg] = useState<string | null>(null);
 
-  // 設定
-  const [thresholdG, setThresholdG] = useState(2.2); // 動加速度（重力除去後）の閾値
+  // 設定 (動加速度 閾値)
+  const [thresholdG, setThresholdG] = useState(2.5); // デフォルトを実用的な2.5Gに調整
   const [showSettings, setShowSettings] = useState(false);
 
   // 撮影
@@ -135,19 +146,22 @@ export default function CyclingDashboard() {
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const currentPosRef = useRef<{ lat: number; lng: number }>({ lat: 35.6561, lng: 139.4378 });
   const currentSpeedRef = useRef<number>(0);
+  const currentAltRef = useRef<number>(0);
   const currentGRef = useRef<number>(0.0);
   const currentVolRef = useRef<number>(0);
-  const lastRecordedPosRef = useRef<{ lat: number; lng: number; time: number } | null>(null);
+  const lastRecordedPosRef = useRef<{ lat: number; lng: number; alt: number; time: number } | null>(null);
   const lastBumpPosRef = useRef<{ lat: number; lng: number; time: number } | null>(null);
   const wakeLockRef = useRef<any>(null);
   const motionListenerRef = useRef<((e: DeviceMotionEvent) => void) | null>(null);
 
-  // 重力フィルタ用変数 (低周波成分を保持)
+  // 加速度ノイズ平滑化バッファ (3点移動平均)
+  const gBufferRef = useRef<number[]>([]);
   const gravityRef = useRef<{ x: number; y: number; z: number }>({ x: 0, y: 0, z: 9.8 });
 
   // Web Audio用
   const audioCtxRef = useRef<AudioContext | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null);
+  const audioIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const allBumpsRef = useRef<BumpPoint[]>([]);
   allBumpsRef.current = allBumps;
@@ -155,6 +169,8 @@ export default function CyclingDashboard() {
   currentRouteRef.current = currentRoute;
   const totalDistRef = useRef<number>(0);
   totalDistRef.current = totalDistanceKm;
+  const elevationGainRef = useRef<number>(0);
+  elevationGainRef.current = elevationGain;
 
   const formatDateTimeId = (ts: number) => {
     const d = new Date(ts);
@@ -196,16 +212,16 @@ export default function CyclingDashboard() {
     localStorage.setItem("velo_accumulated_bumps", JSON.stringify(bumps));
   };
 
-  const saveSessions = (sessions: RideSession[]) => {
-    setAllSessions(sessions);
-    localStorage.setItem("velo_sessions_history", JSON.stringify(sessions));
-  };
-
   const clearAllBumps = () => {
     if (confirm("登録されているすべての段差ピンを消去しますか？")) {
       saveBumps([]);
       setNearbyBump(null);
     }
+  };
+
+  const saveSessions = (sessions: RideSession[]) => {
+    setAllSessions(sessions);
+    localStorage.setItem("velo_sessions_history", JSON.stringify(sessions));
   };
 
   // 2. Google Drive フォルダ一覧取得
@@ -247,7 +263,7 @@ export default function CyclingDashboard() {
     }
   };
 
-  // 3. Google Drive ファイル一括同期（GPSログとM5ログの自動紐付け）
+  // 3. Google Drive ファイル一括同期（全GPSと全M5ログの完全自動紐付け）
   const syncAllDriveFiles = async () => {
     if (driveFiles.length === 0) {
       await scanGoogleDriveFolder();
@@ -273,17 +289,17 @@ export default function CyclingDashboard() {
         const csvText = await fileRes.text();
 
         if (file.type === "GPS" || csvText.includes("[TRACK_LOG]")) {
-          // GPSセッションCSVのパース
           const session = parseGpsSessionCsv(file.name, csvText);
           if (session) {
-            // 同一IDのセッションがすでになければ追加
-            if (!newSessions.some((s) => s.id === session.id)) {
+            const existingIdx = newSessions.findIndex((s) => s.id === session.id);
+            if (existingIdx === -1) {
               newSessions.push(session);
               importedSessionsCount++;
+            } else {
+              newSessions[existingIdx] = session; // 更新
             }
           }
         } else if (file.type === "M5" || csvText.includes("accel_x")) {
-          // M5ログの保存（後でセッションと時刻突合）
           const records = parseM5Csv(csvText);
           if (records.length > 0) {
             m5RecordsList.push({ fileName: file.name, records });
@@ -297,7 +313,6 @@ export default function CyclingDashboard() {
         const m5Start = m5.records[0].epoch_ms;
         const m5End = m5.records[m5.records.length - 1].epoch_ms;
 
-        // 該当するセッションを検索
         for (const session of newSessions) {
           if (session.route.length === 0) continue;
           const sessStart = session.route[0].time;
@@ -305,13 +320,12 @@ export default function CyclingDashboard() {
 
           // 時間帯が重なっているか (前後30分のマージン)
           if (m5End >= sessStart - 1800000 && m5Start <= sessEnd + 1800000) {
-            // セッションのTrackPointにM5の6軸データを最近傍結合
             session.route.forEach((pt) => {
               let minDiff = Infinity;
               let matchedM5: any = null;
               for (const r of m5.records) {
                 const diff = Math.abs(r.epoch_ms - pt.time);
-                if (diff < minDiff && diff <= 1000) { // 1秒以内のデータ
+                if (diff < minDiff && diff <= 1000) {
                   minDiff = diff;
                   matchedM5 = r;
                 }
@@ -321,13 +335,13 @@ export default function CyclingDashboard() {
                 pt.m5Ay = matchedM5.accel_y;
                 pt.m5Az = matchedM5.accel_z;
                 pt.m5ImpactG = matchedM5.impact_g;
+                pt.m5Volume = matchedM5.volume;
               }
             });
 
-            // M5の閾値超え段差をセッション段差に追加
+            // M5の高精度段差（>= thresholdG）をセッション段差に追加
             m5.records.forEach((r) => {
               if (r.impact_g >= thresholdG) {
-                // セッション内から最寄りのGPS座標を検索
                 let bestPt = session.route[0];
                 let minDiff = Infinity;
                 for (const pt of session.route) {
@@ -343,6 +357,7 @@ export default function CyclingDashboard() {
                     id: bumpId,
                     lat: bestPt.lat,
                     lng: bestPt.lng,
+                    altitude: bestPt.altitude,
                     impactG: r.impact_g,
                     timestamp: r.epoch_ms,
                     source: "M5",
@@ -358,10 +373,8 @@ export default function CyclingDashboard() {
         }
       }
 
-      // 保存更新
       saveSessions(newSessions);
 
-      // 全セッションの段差を allBumps にマージ
       const combinedBumps = [...allBumps];
       newSessions.forEach((s) => {
         s.bumps.forEach((b) => {
@@ -372,7 +385,7 @@ export default function CyclingDashboard() {
       });
       saveBumps(combinedBumps);
 
-      setSyncStatusMsg(`同期完了: GPSセッション ${importedSessionsCount}件 追加 / M5ログ ${mergedM5Count}件 結合 / 新規段差 ${newBumpsCount}件 プロット`);
+      setSyncStatusMsg(`同期成功: GPSセッション ${importedSessionsCount}件 追加 / M5突合 ${mergedM5Count}件 完了 / 新規段差 ${newBumpsCount}件 プロット`);
     } catch (err: any) {
       console.error("Full Sync Error:", err);
       setSyncStatusMsg(`同期エラー: ${err.message}`);
@@ -381,7 +394,6 @@ export default function CyclingDashboard() {
     }
   };
 
-  // GPSセッションCSVのパーサー
   const parseGpsSessionCsv = (fileName: string, csvText: string): RideSession | null => {
     const lines = csvText.split(/\r?\n/).map((l) => l.trim()).filter((l) => l);
     if (lines.length <= 1) return null;
@@ -390,6 +402,7 @@ export default function CyclingDashboard() {
     let spot = "日野";
     let bike = "ロードバイク";
     let distance = 0;
+    let elevGain = 0;
 
     lines.forEach((l) => {
       if (l.startsWith("# Title:")) title = l.replace("# Title:", "").trim();
@@ -413,17 +426,33 @@ export default function CyclingDashboard() {
       if (cols.length < 3) continue;
 
       if (curSection === "TRACK_LOG") {
-        if (cols[0] === "epoch_ms") continue; // ヘッダー
+        if (cols[0] === "epoch_ms") continue;
         const ts = parseInt(cols[0], 10);
         const lat = parseFloat(cols[2]);
         const lng = parseFloat(cols[3]);
         const spd = parseFloat(cols[4]) || 0;
         const g = parseFloat(cols[5]) || 0;
         const acc = parseFloat(cols[6]) || 0;
-        const vol = parseFloat(cols[7]) || 0;
+        const alt = parseFloat(cols[7]) || 0;
+        const altAcc = parseFloat(cols[8]) || 0;
+        const head = parseFloat(cols[9]) || 0;
+        const slope = parseFloat(cols[10]) || 0;
+        const vol = parseFloat(cols[11]) || 0;
 
         if (!isNaN(lat) && !isNaN(lng)) {
-          route.push({ lat, lng, time: ts, speed: spd, impactG: g, accuracy: acc, volume: vol });
+          route.push({
+            lat,
+            lng,
+            time: ts,
+            speed: spd,
+            impactG: g,
+            accuracy: acc,
+            altitude: alt,
+            altitudeAccuracy: altAcc,
+            heading: head,
+            slopePct: slope,
+            volume: vol,
+          });
         }
       } else if (curSection === "BUMP_LOG") {
         if (cols[0] === "bump_id") continue;
@@ -431,22 +460,24 @@ export default function CyclingDashboard() {
         const ts = parseInt(cols[1], 10);
         const lat = parseFloat(cols[3]);
         const lng = parseFloat(cols[4]);
-        const g = parseFloat(cols[5]) || 0;
-        const photo = cols[7] !== "NONE" ? cols[7] : undefined;
+        const alt = parseFloat(cols[5]) || 0;
+        const g = parseFloat(cols[6]) || 0;
+        const photo = cols[8] !== "NONE" ? cols[8] : undefined;
 
         if (!isNaN(lat) && !isNaN(lng)) {
-          bumps.push({ id, timestamp: ts, lat, lng, impactG: g, photoFileName: photo, source: "PHONE" });
+          bumps.push({ id, timestamp: ts, lat, lng, altitude: alt, impactG: g, photoFileName: photo, source: "PHONE" });
         }
       }
     }
 
     if (route.length === 0) return null;
 
-    // 距離が未計算の場合は再計算
     if (distance === 0 && route.length > 1) {
       let dSum = 0;
       for (let i = 1; i < route.length; i++) {
         dSum += calcDistanceM(route[i - 1].lat, route[i - 1].lng, route[i].lat, route[i].lng);
+        const altDiff = route[i].altitude - route[i - 1].altitude;
+        if (altDiff > 0.5) elevGain += altDiff;
       }
       distance = dSum / 1000;
     }
@@ -460,10 +491,10 @@ export default function CyclingDashboard() {
       route,
       bumps,
       distanceKm: distance,
+      elevationGainM: elevGain,
     };
   };
 
-  // M5 CSVのパーサー
   const parseM5Csv = (csvText: string) => {
     const lines = csvText.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
     if (lines.length <= 1) return [];
@@ -493,7 +524,7 @@ export default function CyclingDashboard() {
     return records;
   };
 
-  // 4. 重力分離・動的フィルタ付き加速度センサー
+  // 4. 重力分離・ノイズ平滑化（3点移動平均）付き加速度センサー
   const startMotionSensor = async () => {
     if (typeof (DeviceMotionEvent as any) !== "undefined" && typeof (DeviceMotionEvent as any).requestPermission === "function") {
       try {
@@ -510,7 +541,7 @@ export default function CyclingDashboard() {
     }
 
     const handleMotion = (e: DeviceMotionEvent) => {
-      // 停止中・極低速時は検知無効化（信号待ちでのタップ・揺れノイズ除外）
+      // 停止中・歩行未満（3.0 km/h 未満）は誤検知防止のためミュート
       if (currentSpeedRef.current < 3.0) {
         currentGRef.current = 0.0;
         setCurrentG(0.0);
@@ -520,15 +551,12 @@ export default function CyclingDashboard() {
       const pureAcc = e.acceleration;
       const rawAcc = e.accelerationIncludingGravity;
 
-      let dynamicG = 0.0;
+      let rawDynamicG = 0.0;
 
-      // パターンA: 端末が重力除去加速度 (acceleration) を提供している場合
       if (pureAcc && pureAcc.x !== null && pureAcc.y !== null && pureAcc.z !== null) {
-        dynamicG = Math.sqrt(pureAcc.x ** 2 + pureAcc.y ** 2 + pureAcc.z ** 2) / 9.80665;
-      } 
-      // パターンB: 重力込み加速度の場合、EMA（指数移動平均）で低周波の重力ベクトルを差し引く
-      else if (rawAcc && rawAcc.x !== null && rawAcc.y !== null && rawAcc.z !== null) {
-        const alpha = 0.08; // 重力追従フィルタ係数
+        rawDynamicG = Math.sqrt(pureAcc.x ** 2 + pureAcc.y ** 2 + pureAcc.z ** 2) / 9.80665;
+      } else if (rawAcc && rawAcc.x !== null && rawAcc.y !== null && rawAcc.z !== null) {
+        const alpha = 0.05; // 重力推定フィルタ（追従を滑らかに）
         gravityRef.current.x = (1 - alpha) * gravityRef.current.x + alpha * rawAcc.x;
         gravityRef.current.y = (1 - alpha) * gravityRef.current.y + alpha * rawAcc.y;
         gravityRef.current.z = (1 - alpha) * gravityRef.current.z + alpha * rawAcc.z;
@@ -536,35 +564,39 @@ export default function CyclingDashboard() {
         const dynX = rawAcc.x - gravityRef.current.x;
         const dynY = rawAcc.y - gravityRef.current.y;
         const dynZ = rawAcc.z - gravityRef.current.z;
-
-        dynamicG = Math.sqrt(dynX ** 2 + dynY ** 2 + dynZ ** 2) / 9.80665;
+        rawDynamicG = Math.sqrt(dynX ** 2 + dynY ** 2 + dynZ ** 2) / 9.80665;
       }
 
-      // 表示用
-      currentGRef.current = dynamicG;
-      setCurrentG(dynamicG);
-      setMaxG((prev) => Math.max(prev, dynamicG));
+      // ホルダー高周波共振を殺す 3点移動平均（平滑化）
+      gBufferRef.current.push(rawDynamicG);
+      if (gBufferRef.current.length > 3) gBufferRef.current.shift();
+      const smoothedG = gBufferRef.current.reduce((a, b) => a + b, 0) / gBufferRef.current.length;
+
+      currentGRef.current = smoothedG;
+      setCurrentG(smoothedG);
+      setMaxG((prev) => Math.max(prev, smoothedG));
 
       const now = Date.now();
       const p = currentPosRef.current;
 
-      // 段差検知条件:
-      // 1. 動的衝撃Gが閾値以上
-      // 2. 前回検知から2.5秒以上経過
-      // 3. 前回検知地点から15m以上離れている (同一段差での連続多重検知を防止)
+      // 速度連動ベースライン（高速巡航時はノイズが増えるため実効閾値を微調整）
+      const effectiveThreshold = thresholdG + Math.max(0, (currentSpeedRef.current - 20) * 0.03);
+
       let distFromLastBump = Infinity;
       if (lastBumpPosRef.current) {
         distFromLastBump = calcDistanceM(p.lat, p.lng, lastBumpPosRef.current.lat, lastBumpPosRef.current.lng);
       }
 
-      if (dynamicG >= thresholdG && distFromLastBump >= 15.0) {
+      // 段差検知条件: 閾値超え ＆ 前回から15m以上離れている（単一障害物での多重検知ブロック）
+      if (smoothedG >= effectiveThreshold && distFromLastBump >= 15.0) {
         lastBumpPosRef.current = { lat: p.lat, lng: p.lng, time: now };
 
         const newBump: BumpPoint = {
           id: `BUMP_${formatDateTimeId(now)}`,
           lat: p.lat,
           lng: p.lng,
-          impactG: parseFloat(dynamicG.toFixed(2)),
+          altitude: currentAltRef.current,
+          impactG: parseFloat(smoothedG.toFixed(2)),
           timestamp: now,
           source: "PHONE",
         };
@@ -572,7 +604,6 @@ export default function CyclingDashboard() {
         const updated = [newBump, ...allBumpsRef.current];
         saveBumps(updated);
 
-        // 画面フラッシュフィードバック
         const flash = document.createElement("div");
         flash.className = "fixed inset-0 bg-amber-400/40 z-50 pointer-events-none transition-opacity duration-300";
         document.body.appendChild(flash);
@@ -599,13 +630,17 @@ export default function CyclingDashboard() {
     setCurrentG(0.0);
   };
 
-  // 5. 予備マイク音量取得 (Web Audio API)
+  // 5. 予備マイク音量取得 (バックグラウンド完全対応版: setInterval)
   const startAudioRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
       audioStreamRef.current = stream;
+
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       audioCtxRef.current = audioCtx;
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume();
+      }
 
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
@@ -615,24 +650,27 @@ export default function CyclingDashboard() {
       const bufferLength = analyser.frequencyBinCount;
       const dataArray = new Uint8Array(bufferLength);
 
-      const checkVolume = () => {
-        if (!audioCtxRef.current) return;
+      // requestAnimationFrame はバックグラウンドで死ぬため、setInterval で確実に回す
+      audioIntervalRef.current = setInterval(() => {
         analyser.getByteFrequencyData(dataArray);
         let sum = 0;
         for (let i = 0; i < bufferLength; i++) sum += dataArray[i];
         const avg = Math.round(sum / bufferLength);
         currentVolRef.current = avg;
         setCurrentVolume(avg);
-        if (isRecording) requestAnimationFrame(checkVolume);
-      };
-      checkVolume();
+      }, 100);
     } catch (e) {
+      console.warn("Audio mic failed:", e);
       currentVolRef.current = 0;
       setCurrentVolume(0);
     }
   };
 
   const stopAudioRecording = () => {
+    if (audioIntervalRef.current) {
+      clearInterval(audioIntervalRef.current);
+      audioIntervalRef.current = null;
+    }
     if (audioStreamRef.current) {
       audioStreamRef.current.getTracks().forEach((track) => track.stop());
       audioStreamRef.current = null;
@@ -645,7 +683,7 @@ export default function CyclingDashboard() {
     setCurrentVolume(0);
   };
 
-  // 6. GPS追従 (間引き・精度判定・正確な距離積算)
+  // 6. GPS追従 (高度・斜度・精度フル収集＆間引き)
   const startGpsTracking = () => {
     if (!navigator.geolocation) return;
 
@@ -655,32 +693,47 @@ export default function CyclingDashboard() {
         const lng = pos.coords.longitude;
         const spd = pos.coords.speed ? Math.max(0, pos.coords.speed * 3.6) : 0;
         const acc = pos.coords.accuracy || 0;
+        const alt = pos.coords.altitude || 0;
+        const altAcc = pos.coords.altitudeAccuracy || 0;
+        const heading = pos.coords.heading || 0;
         const gpsTime = pos.timestamp || Date.now();
 
         setCurrentSpeed(spd);
         currentSpeedRef.current = spd;
         setGpsAccuracy(Math.round(acc));
+        setCurrentAltitude(Math.round(alt));
+        currentAltRef.current = alt;
         currentPosRef.current = { lat, lng };
 
         if (userMarkerRef.current) userMarkerRef.current.setLatLng([lat, lng]);
         if (mapRef.current) mapRef.current.panTo([lat, lng], { animate: true });
 
-        // 間引き処理: 1秒未満かつ1.5m未満の微動は記録スキップ
+        // 斜度（勾配 %）の計算と間引き
+        let slope = 0;
         const last = lastRecordedPosRef.current;
         if (last) {
           const dM = calcDistanceM(last.lat, last.lng, lat, lng);
           const dtS = (gpsTime - last.time) / 1000;
-          if (dM < 1.5 && dtS < 0.9) return;
+          if (dM < 1.5 && dtS < 0.9) return; // 1.5m未満・0.9秒未満は間引き
 
-          // 距離積算 (測位誤差30m以内の有効データのみ加算)
+          if (dM >= 2.0) {
+            const dAlt = alt - last.alt;
+            slope = parseFloat(((dAlt / dM) * 100).toFixed(1));
+            setCurrentSlope(slope);
+
+            if (dAlt > 0.5 && altAcc <= 15) {
+              setElevationGain((prev) => prev + dAlt);
+            }
+          }
+
           if (dM >= 1.5 && acc <= 30) {
             setTotalDistanceKm((prev) => prev + dM / 1000);
           }
         }
 
-        lastRecordedPosRef.current = { lat, lng, time: gpsTime };
+        lastRecordedPosRef.current = { lat, lng, alt, time: gpsTime };
 
-        // 近傍段差の接近判定
+        // 近傍段差判定
         const unphotographed = allBumpsRef.current.filter((b) => !b.photoUrl);
         let found: BumpPoint | null = null;
         for (const b of unphotographed) {
@@ -699,6 +752,10 @@ export default function CyclingDashboard() {
           speed: parseFloat(spd.toFixed(1)),
           impactG: parseFloat(currentGRef.current.toFixed(2)),
           accuracy: Math.round(acc),
+          altitude: Math.round(alt),
+          altitudeAccuracy: Math.round(altAcc),
+          heading: Math.round(heading),
+          slopePct: slope,
           volume: currentVolRef.current,
         };
 
@@ -712,8 +769,9 @@ export default function CyclingDashboard() {
   const startSensorsAndTracking = async () => {
     setIsRecording(true);
     requestWakeLock();
-    await startMotionSensor();
+    // ユーザー操作直後に同期的に呼び出し
     await startAudioRecording();
+    await startMotionSensor();
     startGpsTracking();
     if (!timerRef.current) {
       timerRef.current = setInterval(() => setElapsedSeconds((s) => s + 1), 1000);
@@ -746,6 +804,7 @@ export default function CyclingDashboard() {
         route: currentRoute,
         bumps: allBumps.filter((b) => currentRoute.some((r) => Math.abs(r.time - b.timestamp) < 7200000)),
         distanceKm: totalDistRef.current,
+        elevationGainM: elevationGainRef.current,
       };
       const updated = [session, ...allSessions];
       saveSessions(updated);
@@ -756,6 +815,7 @@ export default function CyclingDashboard() {
     if (!isRecording) {
       setCurrentRoute([]);
       setTotalDistanceKm(0);
+      setElevationGain(0);
       setElapsedSeconds(0);
       setMaxG(0.0);
       await startSensorsAndTracking();
@@ -816,7 +876,6 @@ export default function CyclingDashboard() {
     const L = (window as any).L;
     if (!L) return;
 
-    // 1. 選択された過去セッションの軌跡 (シアン破線)
     if (sessionRouteLayerRef.current) {
       sessionRouteLayerRef.current.clearLayers();
       const targetSession = allSessions.find((s) => s.id === selectedSessionId) || allSessions[0];
@@ -830,7 +889,6 @@ export default function CyclingDashboard() {
       }
     }
 
-    // 2. 現在記録中の軌跡 (赤実線)
     if (liveRouteLayerRef.current) {
       liveRouteLayerRef.current.clearLayers();
       if (currentRoute.length > 1) {
@@ -842,7 +900,6 @@ export default function CyclingDashboard() {
       }
     }
 
-    // 3. 段差ピン描画
     if (bumpsLayerRef.current) {
       bumpsLayerRef.current.clearLayers();
       allBumps.forEach((bump) => {
@@ -862,6 +919,7 @@ export default function CyclingDashboard() {
             <div style="font-weight:bold; color:${isM5 ? '#7c3aed' : '#d97706'};">${sourceLabel}</div>
             <div><b>ID:</b> <span style="font-family:monospace; font-size:10px;">${bump.id}</span></div>
             <div><b>衝撃値:</b> ${bump.impactG.toFixed(2)} G</div>
+            <div><b>標高:</b> ${bump.altitude ? bump.altitude + ' m' : '-'}</div>
             ${
               hasPhoto
                 ? `
@@ -908,6 +966,7 @@ export default function CyclingDashboard() {
       id: `BUMP_${formatDateTimeId(now)}`,
       lat: currentPosRef.current.lat,
       lng: currentPosRef.current.lng,
+      altitude: currentAltRef.current,
       impactG: currentGRef.current > 0 ? parseFloat(currentGRef.current.toFixed(2)) : 0.0,
       timestamp: now,
       source: "PHONE",
@@ -949,24 +1008,25 @@ export default function CyclingDashboard() {
     if (mapRef.current) mapRef.current.closePopup();
   };
 
+  // CSVエクスポート: 高度(altitude), 高度精度(altitude_accuracy), 斜度(slope_pct) を正式追加
   const downloadSessionCSV = (sess: RideSession) => {
-    const routeHeader = "epoch_ms,iso_utc,lat,lng,speed_kmh,impact_g,accuracy_m,volume,m5_ax,m5_ay,m5_az,m5_impact_g\n";
+    const routeHeader = "epoch_ms,iso_utc,lat,lng,speed_kmh,impact_g,accuracy_m,altitude_m,altitude_accuracy_m,heading_deg,slope_pct,volume,m5_ax,m5_ay,m5_az,m5_impact_g,m5_volume\n";
     const routeBody = sess.route
       .map(
         (r) =>
-          `${r.time},${r.time > 0 ? new Date(r.time).toISOString() : ""},${r.lat},${r.lng},${(r.speed || 0).toFixed(2)},${(r.impactG || 0).toFixed(2)},${r.accuracy || 0},${r.volume || 0},${r.m5Ax ?? ""},${r.m5Ay ?? ""},${r.m5Az ?? ""},${r.m5ImpactG ?? ""}`
+          `${r.time},${r.time > 0 ? new Date(r.time).toISOString() : ""},${r.lat},${r.lng},${(r.speed || 0).toFixed(2)},${(r.impactG || 0).toFixed(2)},${r.accuracy || 0},${r.altitude || 0},${r.altitudeAccuracy || 0},${r.heading || 0},${r.slopePct || 0},${r.volume || 0},${r.m5Ax ?? ""},${r.m5Ay ?? ""},${r.m5Az ?? ""},${r.m5ImpactG ?? ""},${r.m5Volume ?? ""}`
       )
       .join("\n");
 
-    const bumpHeader = "bump_id,epoch_ms,iso_utc,lat,lng,impact_g,status,source,photo_filename\n";
+    const bumpHeader = "bump_id,epoch_ms,iso_utc,lat,lng,altitude_m,impact_g,status,source,photo_filename\n";
     const bumpBody = sess.bumps
       .map(
         (b) =>
-          `${b.id},${b.timestamp},${b.timestamp > 0 ? new Date(b.timestamp).toISOString() : ""},${b.lat},${b.lng},${(b.impactG || 0).toFixed(3)},${b.photoUrl ? "SAVED" : "UNPHOTOGRAPHED"},${b.source || "PHONE"},${b.photoFileName || "NONE"}`
+          `${b.id},${b.timestamp},${b.timestamp > 0 ? new Date(b.timestamp).toISOString() : ""},${b.lat},${b.lng},${b.altitude || 0},${(b.impactG || 0).toFixed(3)},${b.photoUrl ? "SAVED" : "UNPHOTOGRAPHED"},${b.source || "PHONE"},${b.photoFileName || "NONE"}`
       )
       .join("\n");
 
-    const fullContent = `# VeloTelemetry Session Export\n# Title: ${sess.title}\n# Spot: ${sess.spotName}\n# Bike: ${sess.bikeType}\n# DistanceKm: ${sess.distanceKm.toFixed(2)}\n# M5Merged: ${sess.hasM5Merged ? "YES" : "NO"}\n\n[TRACK_LOG]\n${routeHeader}${routeBody}\n\n[BUMP_LOG]\n${bumpHeader}${bumpBody}`;
+    const fullContent = `# VeloTelemetry Session Export\n# Title: ${sess.title}\n# Spot: ${sess.spotName}\n# Bike: ${sess.bikeType}\n# DistanceKm: ${sess.distanceKm.toFixed(2)}\n# ElevationGainM: ${sess.elevationGainM.toFixed(1)}\n# M5Merged: ${sess.hasM5Merged ? "YES" : "NO"}\n\n[TRACK_LOG]\n${routeHeader}${routeBody}\n\n[BUMP_LOG]\n${bumpHeader}${bumpBody}`;
 
     const blob = new Blob([fullContent], { type: "text/csv;charset=utf-8;" });
     const a = document.createElement("a");
@@ -1007,12 +1067,14 @@ export default function CyclingDashboard() {
         <div className="flex justify-between items-center text-xs pb-1.5 border-b border-slate-800">
           <div className="flex items-center gap-2">
             <span className={`w-2.5 h-2.5 rounded-full ${isRecording ? "bg-red-500 animate-ping" : "bg-cyan-400"}`} />
-            <span className="font-bold text-cyan-400">{isRecording ? "LOGGING (FILTER ON)" : "STANDBY"}</span>
+            <span className="font-bold text-cyan-400">{isRecording ? "LOGGING (FILTERED)" : "STANDBY"}</span>
           </div>
-          <div className="flex items-center gap-3 font-mono text-[11px]">
+          <div className="flex items-center gap-2.5 font-mono text-[11px]">
             <span className="text-slate-400">{formatTime(elapsedSeconds)}</span>
             <span className="text-emerald-400 font-bold">{totalDistanceKm.toFixed(2)} km</span>
-            <span className="text-slate-500">±{gpsAccuracy}m</span>
+            <span className="text-cyan-400 font-bold flex items-center gap-0.5">
+              <Mountain className="w-3 h-3" /> {currentAltitude}m ({currentSlope > 0 ? `+${currentSlope}` : currentSlope}%)
+            </span>
             <a
               href="https://drive.google.com/drive/folders/1OyQd7HRAXA9FGUd-BAIP0j193wClvK5r?usp=sharing"
               target="_blank"
@@ -1033,7 +1095,7 @@ export default function CyclingDashboard() {
             </div>
           </div>
           <div className="text-center border-r border-slate-800/80">
-            <div className="text-[9px] text-slate-400 font-bold tracking-wider">PURE IMPACT G</div>
+            <div className="text-[9px] text-slate-400 font-bold tracking-wider">SMOOTH G</div>
             <div className="flex items-baseline justify-center gap-0.5 font-mono">
               <span className={`text-3xl font-black ${currentG >= thresholdG ? "text-amber-400 animate-bounce" : "text-slate-200"}`}>
                 {currentG.toFixed(2)}
@@ -1084,10 +1146,10 @@ export default function CyclingDashboard() {
 
         {showSettings && (
           <div className="mt-2 pt-2 border-t border-slate-800 flex items-center justify-between text-xs">
-            <span className="text-slate-400 text-[11px]">衝撃検知閾値 (重力除去G):</span>
+            <span className="text-slate-400 text-[11px]">衝撃検知閾値 (平滑化動G):</span>
             <input
               type="range"
-              min="1.2"
+              min="1.5"
               max="4.0"
               step="0.1"
               value={thresholdG}
@@ -1108,7 +1170,7 @@ export default function CyclingDashboard() {
             <div className="flex gap-3">
               <span className="flex items-center gap-1 text-cyan-400 font-bold">
                 <span className="w-2 h-2 rounded-full bg-cyan-400" />
-                過去軌跡: {allSessions.find((s) => s.id === selectedSessionId)?.route.length || 0}点
+                選択軌跡: {allSessions.find((s) => s.id === selectedSessionId)?.route.length || 0}点
               </span>
               <span className="flex items-center gap-1 text-rose-400 font-bold">
                 <span className="w-2 h-2 rounded-full bg-rose-500" />
@@ -1193,6 +1255,7 @@ export default function CyclingDashboard() {
                         <span className={`text-[9px] px-1.5 py-0.2 rounded ${b.source === "M5" ? "bg-purple-900 text-purple-300" : "bg-slate-800 text-slate-400"}`}>
                           {b.source === "M5" ? "M5Stack" : "Phone"}
                         </span>
+                        {b.altitude ? <span className="text-[10px] text-slate-500 font-mono">{b.altitude}m</span> : null}
                       </div>
                       <div className="text-[10px] text-slate-400">{b.timestamp > 0 ? new Date(b.timestamp).toLocaleTimeString() : "-"} ({b.lat.toFixed(4)}, {b.lng.toFixed(4)})</div>
                     </div>
@@ -1289,6 +1352,7 @@ export default function CyclingDashboard() {
 
                     <div className="flex justify-between items-center text-[10px] text-slate-400 pt-1.5 border-t border-slate-800/80 font-mono">
                       <span className="text-cyan-400 font-bold">{s.distanceKm.toFixed(2)} km</span>
+                      <span className="text-emerald-400 font-bold">獲得標高: +{s.elevationGainM.toFixed(0)}m</span>
                       <span className="text-amber-400">段差: {s.bumps.length}件</span>
                       <span>{s.route.length} pts</span>
                     </div>
@@ -1329,9 +1393,9 @@ export default function CyclingDashboard() {
             <div className="bg-slate-900 border border-cyan-800/60 rounded-2xl p-3 shadow-lg space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold text-cyan-300 flex items-center gap-1.5">
-                  <Database className="w-4 h-4" /> Google Drive 同期ハブ
+                  <Database className="w-4 h-4" /> Google Drive 全自動突合ハブ
                 </span>
-                <span className="text-[10px] text-slate-400 font-mono">全ファイル自動突合</span>
+                <span className="text-[10px] text-slate-400 font-mono">複数M5/GPS一括マージ</span>
               </div>
 
               <div className="grid grid-cols-2 gap-2">
@@ -1349,7 +1413,7 @@ export default function CyclingDashboard() {
                   className="py-2.5 bg-cyan-600 hover:bg-cyan-500 disabled:bg-slate-800 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 shadow-md"
                 >
                   <FileSpreadsheet className="w-3.5 h-3.5" />
-                  全ログ一括結合同期
+                  全ログ自動突合
                 </button>
               </div>
 
