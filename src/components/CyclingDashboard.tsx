@@ -25,11 +25,17 @@ import {
   Mic,
   Layers,
   FileSpreadsheet,
-  Mountain
+  Mountain,
+  Lock,
+  LogOut,
+  Filter
 } from "lucide-react";
 
 const GOOGLE_API_KEY = "AIzaSyAYislWzcpW08gA9kDP19jL72UF0E_1h6Y";
 const DRIVE_FOLDER_ID = "1OyQd7HRAXA9FGUd-BAIP0j193wClvK5r";
+
+// パスワードの SHA-256 ハッシュ値 (平文: "VeloInvest!2026")
+const AUTH_PASSWORD_HASH = "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918";
 
 interface TrackPoint {
   lat: number;
@@ -43,6 +49,14 @@ interface TrackPoint {
   heading: number;
   slopePct: number;
   volume: number;
+  // スマホ生IMU
+  phoneAx: number;
+  phoneAy: number;
+  phoneAz: number;
+  phoneGx: number;
+  phoneGy: number;
+  phoneGz: number;
+  // M5突合データ（結合時のみ存在）
   m5Ax?: number;
   m5Ay?: number;
   m5Az?: number;
@@ -59,7 +73,7 @@ interface BumpPoint {
   timestamp: number;
   photoUrl?: string;
   photoFileName?: string;
-  source?: "PHONE" | "M5";
+  source: "PHONE" | "M5";
 }
 
 interface DriveFileItem {
@@ -83,6 +97,13 @@ interface RideSession {
   hasM5Merged?: boolean;
 }
 
+async function sha256(message: string): Promise<string> {
+  const msgBuffer = new TextEncoder().encode(message);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 function calcDistanceM(lat1: number, lng1: number, lat2: number, lng2: number) {
   const R = 6371e3;
   const φ1 = (lat1 * Math.PI) / 180;
@@ -94,6 +115,10 @@ function calcDistanceM(lat1: number, lng1: number, lat2: number, lng2: number) {
 }
 
 export default function CyclingDashboard() {
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [passwordInput, setPasswordInput] = useState<string>("");
+  const [authError, setAuthError] = useState<string | null>(null);
+
   const [activeView, setActiveView] = useState<"live" | "photos" | "sessions" | "drive" | "meta">("live");
   const [isRecording, setIsRecording] = useState(false);
 
@@ -109,6 +134,9 @@ export default function CyclingDashboard() {
   const [elevationGain, setElevationGain] = useState(0);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
+  // フィルタ状態
+  const [bumpFilter, setBumpFilter] = useState<"ALL" | "M5" | "PHONE">("ALL");
+
   // メタデータ
   const [rideTitle, setRideTitle] = useState("自宅-大学 実走調査");
   const [spotName, setSpotName] = useState("日野");
@@ -121,13 +149,13 @@ export default function CyclingDashboard() {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [nearbyBump, setNearbyBump] = useState<BumpPoint | null>(null);
 
-  // Google Drive 同期状態
+  // Google Drive
   const [driveFiles, setDriveFiles] = useState<DriveFileItem[]>([]);
   const [isSyncingDrive, setIsSyncingDrive] = useState(false);
   const [syncStatusMsg, setSyncStatusMsg] = useState<string | null>(null);
 
-  // 設定 (動加速度 閾値)
-  const [thresholdG, setThresholdG] = useState(2.5); // デフォルトを実用的な2.5Gに調整
+  // 設定
+  const [thresholdG, setThresholdG] = useState(2.2);
   const [showSettings, setShowSettings] = useState(false);
 
   // 撮影
@@ -149,16 +177,19 @@ export default function CyclingDashboard() {
   const currentAltRef = useRef<number>(0);
   const currentGRef = useRef<number>(0.0);
   const currentVolRef = useRef<number>(0);
+
+  const phoneImuRef = useRef<{ ax: number; ay: number; az: number; gx: number; gy: number; gz: number }>({
+    ax: 0, ay: 0, az: 0, gx: 0, gy: 0, gz: 0
+  });
+
   const lastRecordedPosRef = useRef<{ lat: number; lng: number; alt: number; time: number } | null>(null);
   const lastBumpPosRef = useRef<{ lat: number; lng: number; time: number } | null>(null);
   const wakeLockRef = useRef<any>(null);
   const motionListenerRef = useRef<((e: DeviceMotionEvent) => void) | null>(null);
 
-  // 加速度ノイズ平滑化バッファ (3点移動平均)
   const gBufferRef = useRef<number[]>([]);
   const gravityRef = useRef<{ x: number; y: number; z: number }>({ x: 0, y: 0, z: 9.8 });
 
-  // Web Audio用
   const audioCtxRef = useRef<AudioContext | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null);
   const audioIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -178,6 +209,43 @@ export default function CyclingDashboard() {
     return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
   };
 
+  useEffect(() => {
+    const storedAuth = localStorage.getItem("velo_auth_token");
+    if (storedAuth === AUTH_PASSWORD_HASH) {
+      setIsAuthenticated(true);
+    }
+
+    const savedBumps = localStorage.getItem("velo_accumulated_bumps");
+    if (savedBumps) {
+      try { setAllBumps(JSON.parse(savedBumps)); } catch (e) { console.error(e); }
+    }
+    const savedSessions = localStorage.getItem("velo_sessions_history");
+    if (savedSessions) {
+      try { setAllSessions(JSON.parse(savedSessions)); } catch (e) { console.error(e); }
+    }
+  }, []);
+
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    const hash = await sha256(passwordInput);
+    if (hash === AUTH_PASSWORD_HASH) {
+      localStorage.setItem("velo_auth_token", hash);
+      setIsAuthenticated(true);
+      setPasswordInput("");
+    } else {
+      setAuthError("パスワードが正しくありません");
+      setPasswordInput("");
+    }
+  };
+
+  const handleLogout = () => {
+    if (confirm("ログアウトしますか？")) {
+      localStorage.removeItem("velo_auth_token");
+      setIsAuthenticated(false);
+    }
+  };
+
   const requestWakeLock = async () => {
     if ("wakeLock" in navigator) {
       try {
@@ -194,18 +262,6 @@ export default function CyclingDashboard() {
       wakeLockRef.current = null;
     }
   };
-
-  // 1. ローカルストレージ復元
-  useEffect(() => {
-    const savedBumps = localStorage.getItem("velo_accumulated_bumps");
-    if (savedBumps) {
-      try { setAllBumps(JSON.parse(savedBumps)); } catch (e) { console.error(e); }
-    }
-    const savedSessions = localStorage.getItem("velo_sessions_history");
-    if (savedSessions) {
-      try { setAllSessions(JSON.parse(savedSessions)); } catch (e) { console.error(e); }
-    }
-  }, []);
 
   const saveBumps = (bumps: BumpPoint[]) => {
     setAllBumps(bumps);
@@ -224,7 +280,7 @@ export default function CyclingDashboard() {
     localStorage.setItem("velo_sessions_history", JSON.stringify(sessions));
   };
 
-  // 2. Google Drive フォルダ一覧取得
+  // Google Drive フォルダ一覧取得
   const scanGoogleDriveFolder = async () => {
     setIsSyncingDrive(true);
     setSyncStatusMsg("Googleドライブ内をスキャン中...");
@@ -263,7 +319,7 @@ export default function CyclingDashboard() {
     }
   };
 
-  // 3. Google Drive ファイル一括同期（全GPSと全M5ログの完全自動紐付け）
+  // Google Drive 全ファイル一括突合同期
   const syncAllDriveFiles = async () => {
     if (driveFiles.length === 0) {
       await scanGoogleDriveFolder();
@@ -279,7 +335,6 @@ export default function CyclingDashboard() {
       const newSessions: RideSession[] = [...allSessions];
       const m5RecordsList: { fileName: string; records: any[] }[] = [];
 
-      // 1周目: GPSログをダウンロードしてセッション化
       for (const file of driveFiles) {
         if (!file.name.toLowerCase().endsWith(".csv")) continue;
 
@@ -296,7 +351,7 @@ export default function CyclingDashboard() {
               newSessions.push(session);
               importedSessionsCount++;
             } else {
-              newSessions[existingIdx] = session; // 更新
+              newSessions[existingIdx] = session;
             }
           }
         } else if (file.type === "M5" || csvText.includes("accel_x")) {
@@ -307,7 +362,7 @@ export default function CyclingDashboard() {
         }
       }
 
-      // 2周目: M5ログを時刻（epoch_ms）で最も近いGPSセッションに突合マージ
+      // M5とGPSのミリ秒突合
       for (const m5 of m5RecordsList) {
         if (m5.records.length === 0) continue;
         const m5Start = m5.records[0].epoch_ms;
@@ -318,7 +373,6 @@ export default function CyclingDashboard() {
           const sessStart = session.route[0].time;
           const sessEnd = session.route[session.route.length - 1].time;
 
-          // 時間帯が重なっているか (前後30分のマージン)
           if (m5End >= sessStart - 1800000 && m5Start <= sessEnd + 1800000) {
             session.route.forEach((pt) => {
               let minDiff = Infinity;
@@ -339,7 +393,6 @@ export default function CyclingDashboard() {
               }
             });
 
-            // M5の高精度段差（>= thresholdG）をセッション段差に追加
             m5.records.forEach((r) => {
               if (r.impact_g >= thresholdG) {
                 let bestPt = session.route[0];
@@ -403,17 +456,21 @@ export default function CyclingDashboard() {
     let bike = "ロードバイク";
     let distance = 0;
     let elevGain = 0;
+    let hasMerged = false;
 
     lines.forEach((l) => {
       if (l.startsWith("# Title:")) title = l.replace("# Title:", "").trim();
       if (l.startsWith("# Spot:")) spot = l.replace("# Spot:", "").trim();
       if (l.startsWith("# Bike:")) bike = l.replace("# Bike:", "").trim();
       if (l.startsWith("# DistanceKm:")) distance = parseFloat(l.replace("# DistanceKm:", "").trim()) || 0;
+      if (l.startsWith("# ElevationGainM:")) elevGain = parseFloat(l.replace("# ElevationGainM:", "").trim()) || 0;
+      if (l.startsWith("# SessionType:") && l.includes("M5_INTEGRATED")) hasMerged = true;
     });
 
     const route: TrackPoint[] = [];
     const bumps: BumpPoint[] = [];
     let curSection = "";
+    let trackHeaders: string[] = [];
 
     for (const line of lines) {
       if (line.startsWith("[") && line.endsWith("]")) {
@@ -426,7 +483,11 @@ export default function CyclingDashboard() {
       if (cols.length < 3) continue;
 
       if (curSection === "TRACK_LOG") {
-        if (cols[0] === "epoch_ms") continue;
+        if (cols[0] === "epoch_ms") {
+          trackHeaders = cols;
+          continue;
+        }
+
         const ts = parseInt(cols[0], 10);
         const lat = parseFloat(cols[2]);
         const lng = parseFloat(cols[3]);
@@ -439,21 +500,39 @@ export default function CyclingDashboard() {
         const slope = parseFloat(cols[10]) || 0;
         const vol = parseFloat(cols[11]) || 0;
 
-        if (!isNaN(lat) && !isNaN(lng)) {
-          route.push({
-            lat,
-            lng,
-            time: ts,
-            speed: spd,
-            impactG: g,
-            accuracy: acc,
-            altitude: alt,
-            altitudeAccuracy: altAcc,
-            heading: head,
-            slopePct: slope,
-            volume: vol,
-          });
+        const pt: TrackPoint = {
+          lat,
+          lng,
+          time: ts,
+          speed: spd,
+          impactG: g,
+          accuracy: acc,
+          altitude: alt,
+          altitudeAccuracy: altAcc,
+          heading: head,
+          slopePct: slope,
+          volume: vol,
+          phoneAx: parseFloat(cols[12]) || 0,
+          phoneAy: parseFloat(cols[13]) || 0,
+          phoneAz: parseFloat(cols[14]) || 0,
+          phoneGx: parseFloat(cols[15]) || 0,
+          phoneGy: parseFloat(cols[16]) || 0,
+          phoneGz: parseFloat(cols[17]) || 0,
+        };
+
+        // M5列が存在する場合の読み込み
+        const m5AxIdx = trackHeaders.indexOf("m5_ax");
+        if (m5AxIdx !== -1 && cols.length > m5AxIdx) {
+          pt.m5Ax = cols[m5AxIdx] !== "" ? parseFloat(cols[m5AxIdx]) : undefined;
+          pt.m5Ay = cols[m5AxIdx + 1] !== "" ? parseFloat(cols[m5AxIdx + 1]) : undefined;
+          pt.m5Az = cols[m5AxIdx + 2] !== "" ? parseFloat(cols[m5AxIdx + 2]) : undefined;
+          pt.m5ImpactG = cols[m5AxIdx + 3] !== "" ? parseFloat(cols[m5AxIdx + 3]) : undefined;
+          pt.m5Volume = cols[m5AxIdx + 4] !== "" ? parseFloat(cols[m5AxIdx + 4]) : undefined;
+          if (pt.m5ImpactG !== undefined) hasMerged = true;
         }
+
+        if (!isNaN(lat) && !isNaN(lng)) route.push(pt);
+
       } else if (curSection === "BUMP_LOG") {
         if (cols[0] === "bump_id") continue;
         const id = cols[0];
@@ -462,10 +541,11 @@ export default function CyclingDashboard() {
         const lng = parseFloat(cols[4]);
         const alt = parseFloat(cols[5]) || 0;
         const g = parseFloat(cols[6]) || 0;
-        const photo = cols[8] !== "NONE" ? cols[8] : undefined;
+        const src = (cols[8] === "M5" ? "M5" : "PHONE") as "PHONE" | "M5";
+        const photo = cols[9] !== "NONE" ? cols[9] : undefined;
 
         if (!isNaN(lat) && !isNaN(lng)) {
-          bumps.push({ id, timestamp: ts, lat, lng, altitude: alt, impactG: g, photoFileName: photo, source: "PHONE" });
+          bumps.push({ id, timestamp: ts, lat, lng, altitude: alt, impactG: g, source: src, photoFileName: photo });
         }
       }
     }
@@ -492,6 +572,7 @@ export default function CyclingDashboard() {
       bumps,
       distanceKm: distance,
       elevationGainM: elevGain,
+      hasM5Merged: hasMerged,
     };
   };
 
@@ -524,7 +605,7 @@ export default function CyclingDashboard() {
     return records;
   };
 
-  // 4. 重力分離・ノイズ平滑化（3点移動平均）付き加速度センサー
+  // 4. スマホ 6軸IMU＋平滑化動Gセンサー
   const startMotionSensor = async () => {
     if (typeof (DeviceMotionEvent as any) !== "undefined" && typeof (DeviceMotionEvent as any).requestPermission === "function") {
       try {
@@ -541,7 +622,13 @@ export default function CyclingDashboard() {
     }
 
     const handleMotion = (e: DeviceMotionEvent) => {
-      // 停止中・歩行未満（3.0 km/h 未満）は誤検知防止のためミュート
+      const rot = e.rotationRate;
+      if (rot) {
+        phoneImuRef.current.gx = rot.alpha || 0;
+        phoneImuRef.current.gy = rot.beta || 0;
+        phoneImuRef.current.gz = rot.gamma || 0;
+      }
+
       if (currentSpeedRef.current < 3.0) {
         currentGRef.current = 0.0;
         setCurrentG(0.0);
@@ -554,9 +641,12 @@ export default function CyclingDashboard() {
       let rawDynamicG = 0.0;
 
       if (pureAcc && pureAcc.x !== null && pureAcc.y !== null && pureAcc.z !== null) {
+        phoneImuRef.current.ax = pureAcc.x;
+        phoneImuRef.current.ay = pureAcc.y;
+        phoneImuRef.current.az = pureAcc.z;
         rawDynamicG = Math.sqrt(pureAcc.x ** 2 + pureAcc.y ** 2 + pureAcc.z ** 2) / 9.80665;
       } else if (rawAcc && rawAcc.x !== null && rawAcc.y !== null && rawAcc.z !== null) {
-        const alpha = 0.05; // 重力推定フィルタ（追従を滑らかに）
+        const alpha = 0.05;
         gravityRef.current.x = (1 - alpha) * gravityRef.current.x + alpha * rawAcc.x;
         gravityRef.current.y = (1 - alpha) * gravityRef.current.y + alpha * rawAcc.y;
         gravityRef.current.z = (1 - alpha) * gravityRef.current.z + alpha * rawAcc.z;
@@ -564,10 +654,13 @@ export default function CyclingDashboard() {
         const dynX = rawAcc.x - gravityRef.current.x;
         const dynY = rawAcc.y - gravityRef.current.y;
         const dynZ = rawAcc.z - gravityRef.current.z;
+
+        phoneImuRef.current.ax = dynX;
+        phoneImuRef.current.ay = dynY;
+        phoneImuRef.current.az = dynZ;
         rawDynamicG = Math.sqrt(dynX ** 2 + dynY ** 2 + dynZ ** 2) / 9.80665;
       }
 
-      // ホルダー高周波共振を殺す 3点移動平均（平滑化）
       gBufferRef.current.push(rawDynamicG);
       if (gBufferRef.current.length > 3) gBufferRef.current.shift();
       const smoothedG = gBufferRef.current.reduce((a, b) => a + b, 0) / gBufferRef.current.length;
@@ -578,8 +671,6 @@ export default function CyclingDashboard() {
 
       const now = Date.now();
       const p = currentPosRef.current;
-
-      // 速度連動ベースライン（高速巡航時はノイズが増えるため実効閾値を微調整）
       const effectiveThreshold = thresholdG + Math.max(0, (currentSpeedRef.current - 20) * 0.03);
 
       let distFromLastBump = Infinity;
@@ -587,7 +678,6 @@ export default function CyclingDashboard() {
         distFromLastBump = calcDistanceM(p.lat, p.lng, lastBumpPosRef.current.lat, lastBumpPosRef.current.lng);
       }
 
-      // 段差検知条件: 閾値超え ＆ 前回から15m以上離れている（単一障害物での多重検知ブロック）
       if (smoothedG >= effectiveThreshold && distFromLastBump >= 15.0) {
         lastBumpPosRef.current = { lat: p.lat, lng: p.lng, time: now };
 
@@ -630,7 +720,7 @@ export default function CyclingDashboard() {
     setCurrentG(0.0);
   };
 
-  // 5. 予備マイク音量取得 (バックグラウンド完全対応版: setInterval)
+  // 5. 予備マイク音量取得
   const startAudioRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -650,7 +740,6 @@ export default function CyclingDashboard() {
       const bufferLength = analyser.frequencyBinCount;
       const dataArray = new Uint8Array(bufferLength);
 
-      // requestAnimationFrame はバックグラウンドで死ぬため、setInterval で確実に回す
       audioIntervalRef.current = setInterval(() => {
         analyser.getByteFrequencyData(dataArray);
         let sum = 0;
@@ -683,7 +772,7 @@ export default function CyclingDashboard() {
     setCurrentVolume(0);
   };
 
-  // 6. GPS追従 (高度・斜度・精度フル収集＆間引き)
+  // 6. GPS追従 (全センサー値収集)
   const startGpsTracking = () => {
     if (!navigator.geolocation) return;
 
@@ -708,13 +797,12 @@ export default function CyclingDashboard() {
         if (userMarkerRef.current) userMarkerRef.current.setLatLng([lat, lng]);
         if (mapRef.current) mapRef.current.panTo([lat, lng], { animate: true });
 
-        // 斜度（勾配 %）の計算と間引き
         let slope = 0;
         const last = lastRecordedPosRef.current;
         if (last) {
           const dM = calcDistanceM(last.lat, last.lng, lat, lng);
           const dtS = (gpsTime - last.time) / 1000;
-          if (dM < 1.5 && dtS < 0.9) return; // 1.5m未満・0.9秒未満は間引き
+          if (dM < 1.5 && dtS < 0.9) return;
 
           if (dM >= 2.0) {
             const dAlt = alt - last.alt;
@@ -733,7 +821,6 @@ export default function CyclingDashboard() {
 
         lastRecordedPosRef.current = { lat, lng, alt, time: gpsTime };
 
-        // 近傍段差判定
         const unphotographed = allBumpsRef.current.filter((b) => !b.photoUrl);
         let found: BumpPoint | null = null;
         for (const b of unphotographed) {
@@ -745,6 +832,7 @@ export default function CyclingDashboard() {
         }
         setNearbyBump(found);
 
+        const imu = phoneImuRef.current;
         const newPoint: TrackPoint = {
           lat,
           lng,
@@ -757,6 +845,12 @@ export default function CyclingDashboard() {
           heading: Math.round(heading),
           slopePct: slope,
           volume: currentVolRef.current,
+          phoneAx: parseFloat(imu.ax.toFixed(3)),
+          phoneAy: parseFloat(imu.ay.toFixed(3)),
+          phoneAz: parseFloat(imu.az.toFixed(3)),
+          phoneGx: parseFloat(imu.gx.toFixed(1)),
+          phoneGy: parseFloat(imu.gy.toFixed(1)),
+          phoneGz: parseFloat(imu.gz.toFixed(1)),
         };
 
         setCurrentRoute((prev) => [...prev, newPoint]);
@@ -769,7 +863,6 @@ export default function CyclingDashboard() {
   const startSensorsAndTracking = async () => {
     setIsRecording(true);
     requestWakeLock();
-    // ユーザー操作直後に同期的に呼び出し
     await startAudioRecording();
     await startMotionSensor();
     startGpsTracking();
@@ -805,6 +898,7 @@ export default function CyclingDashboard() {
         bumps: allBumps.filter((b) => currentRoute.some((r) => Math.abs(r.time - b.timestamp) < 7200000)),
         distanceKm: totalDistRef.current,
         elevationGainM: elevationGainRef.current,
+        hasM5Merged: false,
       };
       const updated = [session, ...allSessions];
       saveSessions(updated);
@@ -869,7 +963,7 @@ export default function CyclingDashboard() {
       setTimeout(() => mapRef.current.invalidateSize(), 100);
       drawMap();
     }
-  }, [activeView, selectedSessionId]);
+  }, [activeView, selectedSessionId, bumpFilter]);
 
   const drawMap = () => {
     if (!mapRef.current) return;
@@ -902,18 +996,24 @@ export default function CyclingDashboard() {
 
     if (bumpsLayerRef.current) {
       bumpsLayerRef.current.clearLayers();
-      allBumps.forEach((bump) => {
+      const filteredBumps = allBumps.filter((b) => {
+        if (bumpFilter === "M5") return b.source === "M5";
+        if (bumpFilter === "PHONE") return b.source === "PHONE";
+        return true;
+      });
+
+      filteredBumps.forEach((bump) => {
         const hasPhoto = !!bump.photoUrl;
         const isM5 = bump.source === "M5";
         const marker = L.circleMarker([bump.lat, bump.lng], {
-          radius: hasPhoto ? 8 : 11,
+          radius: hasPhoto ? 8 : (isM5 ? 12 : 9),
           color: hasPhoto ? "#059669" : (isM5 ? "#8b5cf6" : "#ffffff"),
           fillColor: hasPhoto ? "#10b981" : (isM5 ? "#a855f7" : "#f59e0b"),
           fillOpacity: 0.95,
           weight: 3,
         }).addTo(bumpsLayerRef.current);
 
-        const sourceLabel = isM5 ? "【M5Stack高精度】" : "【スマホ予備】";
+        const sourceLabel = isM5 ? "【M5高精度検証済】" : "【スマホ予備】";
         const popupHtml = `
           <div style="color:#0f172a; font-size:12px; min-width:190px;">
             <div style="font-weight:bold; color:${isM5 ? '#7c3aed' : '#d97706'};">${sourceLabel}</div>
@@ -949,7 +1049,7 @@ export default function CyclingDashboard() {
 
   useEffect(() => {
     drawMap();
-  }, [allBumps, currentRoute, allSessions, selectedSessionId]);
+  }, [allBumps, currentRoute, allSessions, selectedSessionId, bumpFilter]);
 
   const triggerCameraForBump = (bump: BumpPoint) => {
     setTargetBump(bump);
@@ -1008,14 +1108,24 @@ export default function CyclingDashboard() {
     if (mapRef.current) mapRef.current.closePopup();
   };
 
-  // CSVエクスポート: 高度(altitude), 高度精度(altitude_accuracy), 斜度(slope_pct) を正式追加
+  // CSVエクスポート（未結合時は空列を完全撤廃、結合時のみM5統合列を付与）
   const downloadSessionCSV = (sess: RideSession) => {
-    const routeHeader = "epoch_ms,iso_utc,lat,lng,speed_kmh,impact_g,accuracy_m,altitude_m,altitude_accuracy_m,heading_deg,slope_pct,volume,m5_ax,m5_ay,m5_az,m5_impact_g,m5_volume\n";
+    const isMerged = !!sess.hasM5Merged;
+
+    // ヘッダーの動的切り替え
+    const baseRouteHeader = "epoch_ms,iso_utc,lat,lng,speed_kmh,pure_impact_g,accuracy_m,altitude_m,altitude_accuracy_m,heading_deg,slope_pct,phone_mic_volume,phone_ax,phone_ay,phone_az,phone_gx,phone_gy,phone_gz";
+    const routeHeader = isMerged
+      ? `${baseRouteHeader},m5_ax,m5_ay,m5_az,m5_impact_g,m5_volume\n`
+      : `${baseRouteHeader}\n`;
+
     const routeBody = sess.route
-      .map(
-        (r) =>
-          `${r.time},${r.time > 0 ? new Date(r.time).toISOString() : ""},${r.lat},${r.lng},${(r.speed || 0).toFixed(2)},${(r.impactG || 0).toFixed(2)},${r.accuracy || 0},${r.altitude || 0},${r.altitudeAccuracy || 0},${r.heading || 0},${r.slopePct || 0},${r.volume || 0},${r.m5Ax ?? ""},${r.m5Ay ?? ""},${r.m5Az ?? ""},${r.m5ImpactG ?? ""},${r.m5Volume ?? ""}`
-      )
+      .map((r) => {
+        const baseRow = `${r.time},${r.time > 0 ? new Date(r.time).toISOString() : ""},${r.lat},${r.lng},${(r.speed || 0).toFixed(2)},${(r.impactG || 0).toFixed(2)},${r.accuracy || 0},${r.altitude || 0},${r.altitudeAccuracy || 0},${r.heading || 0},${r.slopePct || 0},${r.volume || 0},${r.phoneAx || 0},${r.phoneAy || 0},${r.phoneAz || 0},${r.phoneGx || 0},${r.phoneGy || 0},${r.phoneGz || 0}`;
+        if (isMerged) {
+          return `${baseRow},${r.m5Ax ?? ""},${r.m5Ay ?? ""},${r.m5Az ?? ""},${r.m5ImpactG ?? ""},${r.m5Volume ?? ""}`;
+        }
+        return baseRow;
+      })
       .join("\n");
 
     const bumpHeader = "bump_id,epoch_ms,iso_utc,lat,lng,altitude_m,impact_g,status,source,photo_filename\n";
@@ -1026,7 +1136,7 @@ export default function CyclingDashboard() {
       )
       .join("\n");
 
-    const fullContent = `# VeloTelemetry Session Export\n# Title: ${sess.title}\n# Spot: ${sess.spotName}\n# Bike: ${sess.bikeType}\n# DistanceKm: ${sess.distanceKm.toFixed(2)}\n# ElevationGainM: ${sess.elevationGainM.toFixed(1)}\n# M5Merged: ${sess.hasM5Merged ? "YES" : "NO"}\n\n[TRACK_LOG]\n${routeHeader}${routeBody}\n\n[BUMP_LOG]\n${bumpHeader}${bumpBody}`;
+    const fullContent = `# VeloTelemetry Session Export\n# Title: ${sess.title}\n# Spot: ${sess.spotName}\n# Bike: ${sess.bikeType}\n# DistanceKm: ${sess.distanceKm.toFixed(2)}\n# ElevationGainM: ${sess.elevationGainM.toFixed(1)}\n# SessionType: ${isMerged ? "M5_INTEGRATED" : "PHONE_RAW"}\n\n[TRACK_LOG]\n${routeHeader}${routeBody}\n\n[BUMP_LOG]\n${bumpHeader}${bumpBody}`;
 
     const blob = new Blob([fullContent], { type: "text/csv;charset=utf-8;" });
     const a = document.createElement("a");
@@ -1051,6 +1161,49 @@ export default function CyclingDashboard() {
   const unphotographedBumps = allBumps.filter((b) => !b.photoUrl);
   const savedBumps = allBumps.filter((b) => !!b.photoUrl);
 
+  if (!isAuthenticated) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[100dvh] bg-slate-950 text-slate-100 p-4 font-sans select-none">
+        <div className="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-3xl p-6 shadow-2xl space-y-6">
+          <div className="text-center space-y-2">
+            <div className="w-14 h-14 bg-cyan-950 border border-cyan-800 rounded-2xl flex items-center justify-center mx-auto text-cyan-400 shadow-inner">
+              <Lock className="w-7 h-7" />
+            </div>
+            <h1 className="text-xl font-bold tracking-tight text-slate-100">Velo Telemetry System</h1>
+            <p className="text-xs text-slate-400">実験機材アクセス認証</p>
+          </div>
+
+          <form onSubmit={handleLogin} className="space-y-4">
+            <div>
+              <label className="text-[11px] font-bold text-slate-400 block mb-1.5">アクセスキー / パスワード</label>
+              <input
+                type="password"
+                value={passwordInput}
+                onChange={(e) => setPasswordInput(e.target.value)}
+                placeholder="••••••••••••"
+                className="w-full bg-slate-950 border border-slate-800 focus:border-cyan-500 rounded-xl px-4 py-3 text-sm text-slate-100 outline-none font-mono"
+                autoFocus
+              />
+            </div>
+
+            {authError && (
+              <div className="text-xs text-rose-400 bg-rose-950/40 border border-rose-900 p-2.5 rounded-xl text-center">
+                {authError}
+              </div>
+            )}
+
+            <button
+              type="submit"
+              className="w-full py-3 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl text-xs font-bold transition-all shadow-lg active:scale-95"
+            >
+              ログインしてシステム起動
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col h-[100dvh] bg-slate-950 text-slate-100 overflow-hidden font-sans select-none">
       <input
@@ -1067,7 +1220,7 @@ export default function CyclingDashboard() {
         <div className="flex justify-between items-center text-xs pb-1.5 border-b border-slate-800">
           <div className="flex items-center gap-2">
             <span className={`w-2.5 h-2.5 rounded-full ${isRecording ? "bg-red-500 animate-ping" : "bg-cyan-400"}`} />
-            <span className="font-bold text-cyan-400">{isRecording ? "LOGGING (FILTERED)" : "STANDBY"}</span>
+            <span className="font-bold text-cyan-400">{isRecording ? "RECORDING" : "STANDBY"}</span>
           </div>
           <div className="flex items-center gap-2.5 font-mono text-[11px]">
             <span className="text-slate-400">{formatTime(elapsedSeconds)}</span>
@@ -1075,14 +1228,9 @@ export default function CyclingDashboard() {
             <span className="text-cyan-400 font-bold flex items-center gap-0.5">
               <Mountain className="w-3 h-3" /> {currentAltitude}m ({currentSlope > 0 ? `+${currentSlope}` : currentSlope}%)
             </span>
-            <a
-              href="https://drive.google.com/drive/folders/1OyQd7HRAXA9FGUd-BAIP0j193wClvK5r?usp=sharing"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-400"
-            >
-              <ExternalLink className="w-3.5 h-3.5" />
-            </a>
+            <button onClick={handleLogout} className="text-slate-500 hover:text-rose-400 p-1" title="ログアウト">
+              <LogOut className="w-3.5 h-3.5" />
+            </button>
           </div>
         </div>
 
@@ -1146,7 +1294,7 @@ export default function CyclingDashboard() {
 
         {showSettings && (
           <div className="mt-2 pt-2 border-t border-slate-800 flex items-center justify-between text-xs">
-            <span className="text-slate-400 text-[11px]">衝撃検知閾値 (平滑化動G):</span>
+            <span className="text-slate-400 text-[11px]">検知閾値 (平滑動G):</span>
             <input
               type="range"
               min="1.5"
@@ -1166,31 +1314,58 @@ export default function CyclingDashboard() {
         
         {/* ビュー 1: ライブマップ */}
         <div className={`w-full h-full relative ${activeView === "live" ? "block" : "hidden"}`}>
-          <div className="absolute top-2 left-2 z-[400] bg-slate-950/85 backdrop-blur-md px-3 py-1.5 rounded-xl border border-slate-800 flex flex-col gap-1 text-[11px]">
-            <div className="flex gap-3">
-              <span className="flex items-center gap-1 text-cyan-400 font-bold">
-                <span className="w-2 h-2 rounded-full bg-cyan-400" />
-                選択軌跡: {allSessions.find((s) => s.id === selectedSessionId)?.route.length || 0}点
-              </span>
-              <span className="flex items-center gap-1 text-rose-400 font-bold">
-                <span className="w-2 h-2 rounded-full bg-rose-500" />
-                現在走行: {currentRoute.length}点
-              </span>
+          
+          <div className="absolute top-2 left-2 right-2 z-[400] flex flex-col gap-1.5 pointer-events-none">
+            <div className="bg-slate-950/85 backdrop-blur-md px-3 py-1.5 rounded-xl border border-slate-800 flex justify-between items-center text-[11px] pointer-events-auto shadow-md">
+              <div className="flex gap-2.5">
+                <span className="flex items-center gap-1 text-cyan-400 font-bold">
+                  <span className="w-2 h-2 rounded-full bg-cyan-400" />
+                  選択軌跡: {allSessions.find((s) => s.id === selectedSessionId)?.route.length || 0}点
+                </span>
+                <span className="flex items-center gap-1 text-rose-400 font-bold">
+                  <span className="w-2 h-2 rounded-full bg-rose-500" />
+                  現在走行: {currentRoute.length}点
+                </span>
+              </div>
+              {allSessions.length > 0 && (
+                <select
+                  value={selectedSessionId || ""}
+                  onChange={(e) => setSelectedSessionId(e.target.value)}
+                  className="bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-[10px] text-slate-300 outline-none"
+                >
+                  <option value="">最新セッション</option>
+                  {allSessions.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.title} ({s.distanceKm.toFixed(1)}km) {s.hasM5Merged ? "★M5" : ""}
+                    </option>
+                  ))}
+                </select>
+              )}
             </div>
-            {allSessions.length > 0 && (
-              <select
-                value={selectedSessionId || ""}
-                onChange={(e) => setSelectedSessionId(e.target.value)}
-                className="bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-[10px] text-slate-300 outline-none"
+
+            {/* 段差フィルタ切替バー */}
+            <div className="self-start bg-slate-950/90 backdrop-blur-md p-1 rounded-xl border border-slate-800 flex gap-1 pointer-events-auto text-[10px] font-bold shadow-md">
+              <button
+                onClick={() => setBumpFilter("ALL")}
+                className={`px-2.5 py-1 rounded-lg transition-all ${bumpFilter === "ALL" ? "bg-slate-800 text-cyan-300 shadow" : "text-slate-400"}`}
               >
-                <option value="">最新セッション表示</option>
-                {allSessions.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.title} ({s.distanceKm.toFixed(1)}km) {s.hasM5Merged ? "★M5済" : ""}
-                  </option>
-                ))}
-              </select>
-            )}
+                全段差 ({allBumps.length})
+              </button>
+              <button
+                onClick={() => setBumpFilter("M5")}
+                className={`px-2.5 py-1 rounded-lg transition-all flex items-center gap-1 ${bumpFilter === "M5" ? "bg-purple-900 text-purple-200 shadow" : "text-slate-400"}`}
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-purple-400" />
+                M5検証のみ ({allBumps.filter((b) => b.source === "M5").length})
+              </button>
+              <button
+                onClick={() => setBumpFilter("PHONE")}
+                className={`px-2.5 py-1 rounded-lg transition-all flex items-center gap-1 ${bumpFilter === "PHONE" ? "bg-amber-950 text-amber-200 shadow" : "text-slate-400"}`}
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                スマホ予備 ({allBumps.filter((b) => b.source === "PHONE").length})
+              </button>
+            </div>
           </div>
 
           <div ref={mapContainerRef} className="w-full h-full" />
@@ -1321,7 +1496,7 @@ export default function CyclingDashboard() {
             </h3>
             {allSessions.length === 0 ? (
               <div className="text-xs text-slate-500 text-center py-10 bg-slate-900 border border-slate-800 rounded-xl">
-                走行セッションがありません。「Google Drive」タブから同期するか、計測を完了してください。
+                走行セッションがありません。「Drive同期」タブから取り込むか、走行計測を完了してください。
               </div>
             ) : (
               <div className="space-y-2.5">
@@ -1335,9 +1510,13 @@ export default function CyclingDashboard() {
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-1.5 flex-1">
                         <span className="font-bold text-slate-200">{s.title}</span>
-                        {s.hasM5Merged && (
+                        {s.hasM5Merged ? (
                           <span className="px-1.5 py-0.5 bg-purple-950 border border-purple-800 text-purple-300 text-[9px] rounded font-mono">
-                            ★M5突合済
+                            ★M5統合済
+                          </span>
+                        ) : (
+                          <span className="px-1.5 py-0.5 bg-slate-800 border border-slate-700 text-slate-400 text-[9px] rounded font-mono">
+                            生ログ (PHONE)
                           </span>
                         )}
                       </div>
@@ -1371,7 +1550,7 @@ export default function CyclingDashboard() {
                         onClick={() => downloadSessionCSV(s)}
                         className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded text-[10px] font-bold flex items-center gap-1"
                       >
-                        <Download className="w-3 h-3" /> CSV出力
+                        <Download className="w-3 h-3" /> {s.hasM5Merged ? "M5統合CSV出力" : "生ログCSV出力"}
                       </button>
                       <button
                         onClick={() => deleteSession(s.id)}
