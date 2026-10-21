@@ -31,11 +31,12 @@ import {
   Filter
 } from "lucide-react";
 
+// Google Drive 設定 (GitHub Pages用フロントエンド直叩き)
 const GOOGLE_API_KEY = "AIzaSyAYislWzcpW08gA9kDP19jL72UF0E_1h6Y";
 const DRIVE_FOLDER_ID = "1OyQd7HRAXA9FGUd-BAIP0j193wClvK5r";
 
-// パスワードの SHA-256 ハッシュ値 (平文: "VeloInvest!2026")
-const AUTH_PASSWORD_HASH = "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918";
+// パスワード "VeloInvest!2026" の正確な SHA-256 ハッシュ値
+const AUTH_PASSWORD_HASH = "a25c3eadc4fb63da035c24e1e8a2f040495a7a8c35b980f795847c39576a5fa1";
 
 interface TrackPoint {
   lat: number;
@@ -97,6 +98,7 @@ interface RideSession {
   hasM5Merged?: boolean;
 }
 
+// SHA-256 ハッシュ生成関数
 async function sha256(message: string): Promise<string> {
   const msgBuffer = new TextEncoder().encode(message);
   const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
@@ -228,7 +230,7 @@ export default function CyclingDashboard() {
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
-    const hash = await sha256(passwordInput);
+    const hash = await sha256(passwordInput.trim());
     if (hash === AUTH_PASSWORD_HASH) {
       localStorage.setItem("velo_auth_token", hash);
       setIsAuthenticated(true);
@@ -520,7 +522,6 @@ export default function CyclingDashboard() {
           phoneGz: parseFloat(cols[17]) || 0,
         };
 
-        // M5列が存在する場合の読み込み
         const m5AxIdx = trackHeaders.indexOf("m5_ax");
         if (m5AxIdx !== -1 && cols.length > m5AxIdx) {
           pt.m5Ax = cols[m5AxIdx] !== "" ? parseFloat(cols[m5AxIdx]) : undefined;
@@ -1108,11 +1109,10 @@ export default function CyclingDashboard() {
     if (mapRef.current) mapRef.current.closePopup();
   };
 
-  // CSVエクスポート（未結合時は空列を完全撤廃、結合時のみM5統合列を付与）
+  // CSVエクスポート（未結合時は空列なし、結合時のみM5統合列付与）
   const downloadSessionCSV = (sess: RideSession) => {
     const isMerged = !!sess.hasM5Merged;
 
-    // ヘッダーの動的切り替え
     const baseRouteHeader = "epoch_ms,iso_utc,lat,lng,speed_kmh,pure_impact_g,accuracy_m,altitude_m,altitude_accuracy_m,heading_deg,slope_pct,phone_mic_volume,phone_ax,phone_ay,phone_az,phone_gx,phone_gy,phone_gz";
     const routeHeader = isMerged
       ? `${baseRouteHeader},m5_ax,m5_ay,m5_az,m5_impact_g,m5_volume\n`
