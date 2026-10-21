@@ -28,10 +28,10 @@ import {
   Mountain,
   Lock,
   LogOut,
-  Filter
+  Filter,
+  Activity
 } from "lucide-react";
 
-// Google Drive 設定 (GitHub Pages用フロントエンド直叩き)
 const GOOGLE_API_KEY = "AIzaSyAYislWzcpW08gA9kDP19jL72UF0E_1h6Y";
 const DRIVE_FOLDER_ID = "1OyQd7HRAXA9FGUd-BAIP0j193wClvK5r";
 
@@ -57,7 +57,7 @@ interface TrackPoint {
   phoneGx: number;
   phoneGy: number;
   phoneGz: number;
-  // M5突合データ（結合時のみ存在）
+  // M5突合データ
   m5Ax?: number;
   m5Ay?: number;
   m5Az?: number;
@@ -98,7 +98,6 @@ interface RideSession {
   hasM5Merged?: boolean;
 }
 
-// SHA-256 ハッシュ生成関数
 async function sha256(message: string): Promise<string> {
   const msgBuffer = new TextEncoder().encode(message);
   const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
@@ -123,6 +122,11 @@ export default function CyclingDashboard() {
 
   const [activeView, setActiveView] = useState<"live" | "photos" | "sessions" | "drive" | "meta">("live");
   const [isRecording, setIsRecording] = useState(false);
+
+  // センサー動作インジケーター
+  const [motionStatus, setMotionStatus] = useState<"STANDBY" | "OK" | "ERR">("STANDBY");
+  const [micStatus, setMicStatus] = useState<"STANDBY" | "OK" | "ERR">("STANDBY");
+  const [gpsStatus, setGpsStatus] = useState<"STANDBY" | "OK" | "ERR">("STANDBY");
 
   // リアルタイム指標
   const [currentSpeed, setCurrentSpeed] = useState(0);
@@ -211,6 +215,7 @@ export default function CyclingDashboard() {
     return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
   };
 
+  // 1. 初期化・認証確認
   useEffect(() => {
     const storedAuth = localStorage.getItem("velo_auth_token");
     if (storedAuth === AUTH_PASSWORD_HASH) {
@@ -282,7 +287,550 @@ export default function CyclingDashboard() {
     localStorage.setItem("velo_sessions_history", JSON.stringify(sessions));
   };
 
-  // Google Drive フォルダ一覧取得
+  // 2. 地図初期化（認証後・コンテナ出現時に確実にバインド）
+  const initMap = () => {
+    if (!mapContainerRef.current || mapRef.current) return;
+    const L = (window as any).L;
+    if (!L) return;
+
+    try {
+      const map = L.map(mapContainerRef.current, {
+        zoomControl: false,
+        attributionControl: false,
+      }).setView([currentPosRef.current.lat, currentPosRef.current.lng], 16);
+
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(map);
+
+      sessionRouteLayerRef.current = L.layerGroup().addTo(map);
+      liveRouteLayerRef.current = L.layerGroup().addTo(map);
+      bumpsLayerRef.current = L.layerGroup().addTo(map);
+
+      userMarkerRef.current = L.circleMarker([currentPosRef.current.lat, currentPosRef.current.lng], {
+        radius: 8,
+        color: "#2563eb",
+        fillColor: "#3b82f6",
+        fillOpacity: 1,
+        weight: 3,
+      }).addTo(map);
+
+      mapRef.current = map;
+      drawMap();
+    } catch (err) {
+      console.error("Leaflet Map Init Error:", err);
+    }
+  };
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    // Leaflet CSS を動的に保証
+    if (!document.getElementById("leaflet-css")) {
+      const link = document.createElement("link");
+      link.id = "leaflet-css";
+      link.rel = "stylesheet";
+      link.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+      document.head.appendChild(link);
+    }
+
+    if (!(window as any).L) {
+      const script = document.createElement("script");
+      script.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+      script.onload = () => {
+        setTimeout(initMap, 50);
+      };
+      document.head.appendChild(script);
+    } else {
+      setTimeout(initMap, 50);
+    }
+  }, [isAuthenticated]);
+
+  useEffect(() => {
+    if (activeView === "live" && mapRef.current) {
+      setTimeout(() => {
+        mapRef.current.invalidateSize();
+        drawMap();
+      }, 100);
+    }
+  }, [activeView, selectedSessionId, bumpFilter]);
+
+  const drawMap = () => {
+    if (!mapRef.current) return;
+    const L = (window as any).L;
+    if (!L) return;
+
+    if (sessionRouteLayerRef.current) {
+      sessionRouteLayerRef.current.clearLayers();
+      const targetSession = allSessions.find((s) => s.id === selectedSessionId) || allSessions[0];
+      if (targetSession && targetSession.route.length > 1) {
+        L.polyline(targetSession.route.map((p) => [p.lat, p.lng]), {
+          color: "#06b6d4",
+          weight: 4,
+          opacity: 0.75,
+          dashArray: "6, 6",
+        }).addTo(sessionRouteLayerRef.current);
+      }
+    }
+
+    if (liveRouteLayerRef.current) {
+      liveRouteLayerRef.current.clearLayers();
+      if (currentRoute.length > 1) {
+        L.polyline(currentRoute.map((p) => [p.lat, p.lng]), {
+          color: "#e11d48",
+          weight: 5,
+          opacity: 0.95,
+        }).addTo(liveRouteLayerRef.current);
+      }
+    }
+
+    if (bumpsLayerRef.current) {
+      bumpsLayerRef.current.clearLayers();
+      const filteredBumps = allBumps.filter((b) => {
+        if (bumpFilter === "M5") return b.source === "M5";
+        if (bumpFilter === "PHONE") return b.source === "PHONE";
+        return true;
+      });
+
+      filteredBumps.forEach((bump) => {
+        const hasPhoto = !!bump.photoUrl;
+        const isM5 = bump.source === "M5";
+        const marker = L.circleMarker([bump.lat, bump.lng], {
+          radius: hasPhoto ? 8 : (isM5 ? 12 : 9),
+          color: hasPhoto ? "#059669" : (isM5 ? "#8b5cf6" : "#ffffff"),
+          fillColor: hasPhoto ? "#10b981" : (isM5 ? "#a855f7" : "#f59e0b"),
+          fillOpacity: 0.95,
+          weight: 3,
+        }).addTo(bumpsLayerRef.current);
+
+        const sourceLabel = isM5 ? "【M5高精度検証済】" : "【スマホ予備】";
+        const popupHtml = `
+          <div style="color:#0f172a; font-size:12px; min-width:190px;">
+            <div style="font-weight:bold; color:${isM5 ? '#7c3aed' : '#d97706'};">${sourceLabel}</div>
+            <div><b>ID:</b> <span style="font-family:monospace; font-size:10px;">${bump.id}</span></div>
+            <div><b>衝撃値:</b> ${bump.impactG.toFixed(2)} G</div>
+            <div><b>標高:</b> ${bump.altitude ? bump.altitude + ' m' : '-'}</div>
+            ${
+              hasPhoto
+                ? `
+                  <div style="font-size:10px; color:#475569; word-break:break-all; margin-top:4px;">📁 ${bump.photoFileName}</div>
+                  <img src="${bump.photoUrl}" style="width:100%; border-radius:6px; margin-top:4px;" />
+                `
+                : `
+                  <div style="display:flex; gap:6px; margin-top:8px;">
+                    <button id="btn_photo_${bump.id}" style="flex:2; background:#0284c7; color:#fff; border:none; padding:6px; border-radius:6px; font-weight:bold; cursor:pointer;">📸 撮影</button>
+                    <button id="btn_del_${bump.id}" style="flex:1; background:#ef4444; color:#fff; border:none; padding:6px; border-radius:6px; font-weight:bold; cursor:pointer;">🗑️ 破棄</button>
+                  </div>
+                `
+            }
+          </div>
+        `;
+
+        marker.bindPopup(popupHtml);
+        marker.on("popupopen", () => {
+          const btnPhoto = document.getElementById(`btn_photo_${bump.id}`);
+          if (btnPhoto) btnPhoto.onclick = () => triggerCameraForBump(bump);
+          const btnDel = document.getElementById(`btn_del_${bump.id}`);
+          if (btnDel) btnDel.onclick = () => deleteBump(bump.id);
+        });
+      });
+    }
+  };
+
+  useEffect(() => {
+    drawMap();
+  }, [allBumps, currentRoute, allSessions, selectedSessionId, bumpFilter]);
+
+  // 3. モーションセンサー開始（iOS Safari最優先同期実行）
+  const startMotionSensorDirectly = async (): Promise<boolean> => {
+    // iOS 13+ Safariの permission 要求
+    if (typeof (DeviceMotionEvent as any) !== "undefined" && typeof (DeviceMotionEvent as any).requestPermission === "function") {
+      try {
+        const permissionState = await (DeviceMotionEvent as any).requestPermission();
+        if (permissionState !== "granted") {
+          setMotionStatus("ERR");
+          return false;
+        }
+      } catch (e: any) {
+        console.error("DeviceMotion permission error:", e);
+        setMotionStatus("ERR");
+        return false;
+      }
+    }
+
+    const handleMotion = (e: DeviceMotionEvent) => {
+      const rot = e.rotationRate;
+      if (rot) {
+        phoneImuRef.current.gx = rot.alpha || 0;
+        phoneImuRef.current.gy = rot.beta || 0;
+        phoneImuRef.current.gz = rot.gamma || 0;
+      }
+
+      const pureAcc = e.acceleration;
+      const rawAcc = e.accelerationIncludingGravity;
+
+      let rawDynamicG = 0.0;
+
+      if (pureAcc && pureAcc.x !== null && pureAcc.y !== null && pureAcc.z !== null) {
+        phoneImuRef.current.ax = pureAcc.x;
+        phoneImuRef.current.ay = pureAcc.y;
+        phoneImuRef.current.az = pureAcc.z;
+        rawDynamicG = Math.sqrt(pureAcc.x ** 2 + pureAcc.y ** 2 + pureAcc.z ** 2) / 9.80665;
+      } else if (rawAcc && rawAcc.x !== null && rawAcc.y !== null && rawAcc.z !== null) {
+        const alpha = 0.05;
+        gravityRef.current.x = (1 - alpha) * gravityRef.current.x + alpha * rawAcc.x;
+        gravityRef.current.y = (1 - alpha) * gravityRef.current.y + alpha * rawAcc.y;
+        gravityRef.current.z = (1 - alpha) * gravityRef.current.z + alpha * rawAcc.z;
+
+        const dynX = rawAcc.x - gravityRef.current.x;
+        const dynY = rawAcc.y - gravityRef.current.y;
+        const dynZ = rawAcc.z - gravityRef.current.z;
+
+        phoneImuRef.current.ax = dynX;
+        phoneImuRef.current.ay = dynY;
+        phoneImuRef.current.az = dynZ;
+        rawDynamicG = Math.sqrt(dynX ** 2 + dynY ** 2 + dynZ ** 2) / 9.80665;
+      }
+
+      gBufferRef.current.push(rawDynamicG);
+      if (gBufferRef.current.length > 3) gBufferRef.current.shift();
+      const smoothedG = gBufferRef.current.reduce((a, b) => a + b, 0) / gBufferRef.current.length;
+
+      currentGRef.current = smoothedG;
+      setCurrentG(smoothedG);
+      setMaxG((prev) => Math.max(prev, smoothedG));
+
+      // 停止中・歩行未満（3.0 km/h 未満）は段差検知をミュート
+      if (currentSpeedRef.current < 3.0) return;
+
+      const now = Date.now();
+      const p = currentPosRef.current;
+      const effectiveThreshold = thresholdG + Math.max(0, (currentSpeedRef.current - 20) * 0.03);
+
+      let distFromLastBump = Infinity;
+      if (lastBumpPosRef.current) {
+        distFromLastBump = calcDistanceM(p.lat, p.lng, lastBumpPosRef.current.lat, lastBumpPosRef.current.lng);
+      }
+
+      if (smoothedG >= effectiveThreshold && distFromLastBump >= 15.0) {
+        lastBumpPosRef.current = { lat: p.lat, lng: p.lng, time: now };
+
+        const newBump: BumpPoint = {
+          id: `BUMP_${formatDateTimeId(now)}`,
+          lat: p.lat,
+          lng: p.lng,
+          altitude: currentAltRef.current,
+          impactG: parseFloat(smoothedG.toFixed(2)),
+          timestamp: now,
+          source: "PHONE",
+        };
+
+        const updated = [newBump, ...allBumpsRef.current];
+        saveBumps(updated);
+
+        const flash = document.createElement("div");
+        flash.className = "fixed inset-0 bg-amber-400/40 z-50 pointer-events-none transition-opacity duration-300";
+        document.body.appendChild(flash);
+        setTimeout(() => {
+          flash.style.opacity = "0";
+          setTimeout(() => document.body.removeChild(flash), 300);
+        }, 150);
+      }
+    };
+
+    if (motionListenerRef.current) {
+      window.removeEventListener("devicemotion", motionListenerRef.current);
+    }
+    motionListenerRef.current = handleMotion;
+    window.addEventListener("devicemotion", handleMotion, { passive: true });
+    setMotionStatus("OK");
+    return true;
+  };
+
+  const stopMotionSensor = () => {
+    if (motionListenerRef.current) {
+      window.removeEventListener("devicemotion", motionListenerRef.current);
+      motionListenerRef.current = null;
+    }
+    currentGRef.current = 0.0;
+    setCurrentG(0.0);
+    setMotionStatus("STANDBY");
+  };
+
+  // 4. マイク音量取得
+  const startAudioRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      audioStreamRef.current = stream;
+
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      audioCtxRef.current = audioCtx;
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume();
+      }
+
+      const source = audioCtx.createMediaStreamSource(stream);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+
+      const bufferLength = analyser.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+
+      audioIntervalRef.current = setInterval(() => {
+        analyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < bufferLength; i++) sum += dataArray[i];
+        const avg = Math.round(sum / bufferLength);
+        currentVolRef.current = avg;
+        setCurrentVolume(avg);
+      }, 100);
+
+      setMicStatus("OK");
+    } catch (e) {
+      console.warn("Audio mic failed:", e);
+      currentVolRef.current = 0;
+      setCurrentVolume(0);
+      setMicStatus("ERR");
+    }
+  };
+
+  const stopAudioRecording = () => {
+    if (audioIntervalRef.current) {
+      clearInterval(audioIntervalRef.current);
+      audioIntervalRef.current = null;
+    }
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getTracks().forEach((track) => track.stop());
+      audioStreamRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close();
+      audioCtxRef.current = null;
+    }
+    currentVolRef.current = 0;
+    setCurrentVolume(0);
+    setMicStatus("STANDBY");
+  };
+
+  // 5. GPS追従
+  const startGpsTracking = () => {
+    if (!navigator.geolocation) {
+      setGpsStatus("ERR");
+      return;
+    }
+
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        setGpsStatus("OK");
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        const spd = pos.coords.speed ? Math.max(0, pos.coords.speed * 3.6) : 0;
+        const acc = pos.coords.accuracy || 0;
+        const alt = pos.coords.altitude || 0;
+        const altAcc = pos.coords.altitudeAccuracy || 0;
+        const heading = pos.coords.heading || 0;
+        const gpsTime = pos.timestamp || Date.now();
+
+        setCurrentSpeed(spd);
+        currentSpeedRef.current = spd;
+        setGpsAccuracy(Math.round(acc));
+        setCurrentAltitude(Math.round(alt));
+        currentAltRef.current = alt;
+        currentPosRef.current = { lat, lng };
+
+        if (userMarkerRef.current) userMarkerRef.current.setLatLng([lat, lng]);
+        if (mapRef.current) mapRef.current.panTo([lat, lng], { animate: true });
+
+        let slope = 0;
+        const last = lastRecordedPosRef.current;
+        if (last) {
+          const dM = calcDistanceM(last.lat, last.lng, lat, lng);
+          const dtS = (gpsTime - last.time) / 1000;
+          if (dM < 1.5 && dtS < 0.9) return;
+
+          if (dM >= 2.0) {
+            const dAlt = alt - last.alt;
+            slope = parseFloat(((dAlt / dM) * 100).toFixed(1));
+            setCurrentSlope(slope);
+
+            if (dAlt > 0.5 && altAcc <= 15) {
+              setElevationGain((prev) => prev + dAlt);
+            }
+          }
+
+          if (dM >= 1.5 && acc <= 30) {
+            setTotalDistanceKm((prev) => prev + dM / 1000);
+          }
+        }
+
+        lastRecordedPosRef.current = { lat, lng, alt, time: gpsTime };
+
+        const unphotographed = allBumpsRef.current.filter((b) => !b.photoUrl);
+        let found: BumpPoint | null = null;
+        for (const b of unphotographed) {
+          const d = calcDistanceM(lat, lng, b.lat, b.lng);
+          if (d <= 35) {
+            found = b;
+            break;
+          }
+        }
+        setNearbyBump(found);
+
+        const imu = phoneImuRef.current;
+        const newPoint: TrackPoint = {
+          lat,
+          lng,
+          time: gpsTime,
+          speed: parseFloat(spd.toFixed(1)),
+          impactG: parseFloat(currentGRef.current.toFixed(2)),
+          accuracy: Math.round(acc),
+          altitude: Math.round(alt),
+          altitudeAccuracy: Math.round(altAcc),
+          heading: Math.round(heading),
+          slopePct: slope,
+          volume: currentVolRef.current,
+          phoneAx: parseFloat(imu.ax.toFixed(3)),
+          phoneAy: parseFloat(imu.ay.toFixed(3)),
+          phoneAz: parseFloat(imu.az.toFixed(3)),
+          phoneGx: parseFloat(imu.gx.toFixed(1)),
+          phoneGy: parseFloat(imu.gy.toFixed(1)),
+          phoneGz: parseFloat(imu.gz.toFixed(1)),
+        };
+
+        setCurrentRoute((prev) => [...prev, newPoint]);
+      },
+      (err) => {
+        console.error("GPS Watch Error:", err);
+        setGpsStatus("ERR");
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+  };
+
+  // 計測スタート処理（ボタンタップ直後にモーションセンサー許可を同期発火！）
+  const startSensorsAndTracking = async () => {
+    setIsRecording(true);
+    requestWakeLock();
+
+    // ★iOS Safariの最重要点: ユーザーのタップ直後に一切のawaitを挟まず呼ぶ！
+    const motionOk = await startMotionSensorDirectly();
+    if (!motionOk) {
+      alert("【iOS Safari 注意】\nモーションセンサーへのアクセスが許可されませんでした。\n設定アプリ > Safari > モーションと方向のアクセス をオンにしてください。");
+    }
+
+    // 次にマイクとGPS
+    await startAudioRecording();
+    startGpsTracking();
+
+    if (!timerRef.current) {
+      timerRef.current = setInterval(() => setElapsedSeconds((s) => s + 1), 1000);
+    }
+  };
+
+  const stopSensorsAndTracking = () => {
+    setIsRecording(false);
+    releaseWakeLock();
+    stopMotionSensor();
+    stopAudioRecording();
+    if (watchIdRef.current) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    lastRecordedPosRef.current = null;
+    lastBumpPosRef.current = null;
+
+    if (currentRoute.length > 0) {
+      const session: RideSession = {
+        id: `SESS_${formatDateTimeId(Date.now())}`,
+        title: rideTitle,
+        spotName,
+        bikeType,
+        startTime: currentRoute[0]?.time || Date.now(),
+        route: currentRoute,
+        bumps: allBumps.filter((b) => currentRoute.some((r) => Math.abs(r.time - b.timestamp) < 7200000)),
+        distanceKm: totalDistRef.current,
+        elevationGainM: elevationGainRef.current,
+        hasM5Merged: false,
+      };
+      const updated = [session, ...allSessions];
+      saveSessions(updated);
+    }
+  };
+
+  const toggleRecording = async () => {
+    if (!isRecording) {
+      setCurrentRoute([]);
+      setTotalDistanceKm(0);
+      setElevationGain(0);
+      setElapsedSeconds(0);
+      setMaxG(0.0);
+      await startSensorsAndTracking();
+    } else {
+      stopSensorsAndTracking();
+    }
+  };
+
+  const triggerCameraForBump = (bump: BumpPoint) => {
+    setTargetBump(bump);
+    fileInputRef.current?.click();
+  };
+
+  const triggerQuickCapture = () => {
+    if (nearbyBump) {
+      triggerCameraForBump(nearbyBump);
+      return;
+    }
+    const now = Date.now();
+    const newBump: BumpPoint = {
+      id: `BUMP_${formatDateTimeId(now)}`,
+      lat: currentPosRef.current.lat,
+      lng: currentPosRef.current.lng,
+      altitude: currentAltRef.current,
+      impactG: currentGRef.current > 0 ? parseFloat(currentGRef.current.toFixed(2)) : 0.0,
+      timestamp: now,
+      source: "PHONE",
+    };
+    saveBumps([newBump, ...allBumps]);
+    triggerCameraForBump(newBump);
+  };
+
+  const handlePhotoCapture = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !targetBump) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const dataUrl = event.target?.result as string;
+      const dateStr = formatDateTimeId(targetBump.timestamp);
+      const fileName = `IMG_${dateStr}_${targetBump.timestamp}_${targetBump.impactG.toFixed(2)}G_${targetBump.lat.toFixed(5)}_${targetBump.lng.toFixed(5)}.jpg`;
+
+      const a = document.createElement("a");
+      a.href = dataUrl;
+      a.download = fileName;
+      a.click();
+
+      const updated = allBumps.map((b) =>
+        b.id === targetBump.id ? { ...b, photoUrl: dataUrl, photoFileName: fileName } : b
+      );
+      saveBumps(updated);
+
+      setTargetBump(null);
+      setNearbyBump(null);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const deleteBump = (id: string) => {
+    const updated = allBumps.filter((b) => b.id !== id);
+    saveBumps(updated);
+    if (nearbyBump?.id === id) setNearbyBump(null);
+    if (mapRef.current) mapRef.current.closePopup();
+  };
+
+  // Google Drive スキャン＆同期
   const scanGoogleDriveFolder = async () => {
     setIsSyncingDrive(true);
     setSyncStatusMsg("Googleドライブ内をスキャン中...");
@@ -321,7 +869,6 @@ export default function CyclingDashboard() {
     }
   };
 
-  // Google Drive 全ファイル一括突合同期
   const syncAllDriveFiles = async () => {
     if (driveFiles.length === 0) {
       await scanGoogleDriveFolder();
@@ -364,7 +911,6 @@ export default function CyclingDashboard() {
         }
       }
 
-      // M5とGPSのミリ秒突合
       for (const m5 of m5RecordsList) {
         if (m5.records.length === 0) continue;
         const m5Start = m5.records[0].epoch_ms;
@@ -606,510 +1152,7 @@ export default function CyclingDashboard() {
     return records;
   };
 
-  // 4. スマホ 6軸IMU＋平滑化動Gセンサー
-  const startMotionSensor = async () => {
-    if (typeof (DeviceMotionEvent as any) !== "undefined" && typeof (DeviceMotionEvent as any).requestPermission === "function") {
-      try {
-        const permissionState = await (DeviceMotionEvent as any).requestPermission();
-        if (permissionState !== "granted") {
-          currentGRef.current = 0.0;
-          setCurrentG(0.0);
-          return;
-        }
-      } catch (e) {
-        console.error("DeviceMotion permission error:", e);
-        return;
-      }
-    }
-
-    const handleMotion = (e: DeviceMotionEvent) => {
-      const rot = e.rotationRate;
-      if (rot) {
-        phoneImuRef.current.gx = rot.alpha || 0;
-        phoneImuRef.current.gy = rot.beta || 0;
-        phoneImuRef.current.gz = rot.gamma || 0;
-      }
-
-      if (currentSpeedRef.current < 3.0) {
-        currentGRef.current = 0.0;
-        setCurrentG(0.0);
-        return;
-      }
-
-      const pureAcc = e.acceleration;
-      const rawAcc = e.accelerationIncludingGravity;
-
-      let rawDynamicG = 0.0;
-
-      if (pureAcc && pureAcc.x !== null && pureAcc.y !== null && pureAcc.z !== null) {
-        phoneImuRef.current.ax = pureAcc.x;
-        phoneImuRef.current.ay = pureAcc.y;
-        phoneImuRef.current.az = pureAcc.z;
-        rawDynamicG = Math.sqrt(pureAcc.x ** 2 + pureAcc.y ** 2 + pureAcc.z ** 2) / 9.80665;
-      } else if (rawAcc && rawAcc.x !== null && rawAcc.y !== null && rawAcc.z !== null) {
-        const alpha = 0.05;
-        gravityRef.current.x = (1 - alpha) * gravityRef.current.x + alpha * rawAcc.x;
-        gravityRef.current.y = (1 - alpha) * gravityRef.current.y + alpha * rawAcc.y;
-        gravityRef.current.z = (1 - alpha) * gravityRef.current.z + alpha * rawAcc.z;
-
-        const dynX = rawAcc.x - gravityRef.current.x;
-        const dynY = rawAcc.y - gravityRef.current.y;
-        const dynZ = rawAcc.z - gravityRef.current.z;
-
-        phoneImuRef.current.ax = dynX;
-        phoneImuRef.current.ay = dynY;
-        phoneImuRef.current.az = dynZ;
-        rawDynamicG = Math.sqrt(dynX ** 2 + dynY ** 2 + dynZ ** 2) / 9.80665;
-      }
-
-      gBufferRef.current.push(rawDynamicG);
-      if (gBufferRef.current.length > 3) gBufferRef.current.shift();
-      const smoothedG = gBufferRef.current.reduce((a, b) => a + b, 0) / gBufferRef.current.length;
-
-      currentGRef.current = smoothedG;
-      setCurrentG(smoothedG);
-      setMaxG((prev) => Math.max(prev, smoothedG));
-
-      const now = Date.now();
-      const p = currentPosRef.current;
-      const effectiveThreshold = thresholdG + Math.max(0, (currentSpeedRef.current - 20) * 0.03);
-
-      let distFromLastBump = Infinity;
-      if (lastBumpPosRef.current) {
-        distFromLastBump = calcDistanceM(p.lat, p.lng, lastBumpPosRef.current.lat, lastBumpPosRef.current.lng);
-      }
-
-      if (smoothedG >= effectiveThreshold && distFromLastBump >= 15.0) {
-        lastBumpPosRef.current = { lat: p.lat, lng: p.lng, time: now };
-
-        const newBump: BumpPoint = {
-          id: `BUMP_${formatDateTimeId(now)}`,
-          lat: p.lat,
-          lng: p.lng,
-          altitude: currentAltRef.current,
-          impactG: parseFloat(smoothedG.toFixed(2)),
-          timestamp: now,
-          source: "PHONE",
-        };
-
-        const updated = [newBump, ...allBumpsRef.current];
-        saveBumps(updated);
-
-        const flash = document.createElement("div");
-        flash.className = "fixed inset-0 bg-amber-400/40 z-50 pointer-events-none transition-opacity duration-300";
-        document.body.appendChild(flash);
-        setTimeout(() => {
-          flash.style.opacity = "0";
-          setTimeout(() => document.body.removeChild(flash), 300);
-        }, 150);
-      }
-    };
-
-    if (motionListenerRef.current) {
-      window.removeEventListener("devicemotion", motionListenerRef.current);
-    }
-    motionListenerRef.current = handleMotion;
-    window.addEventListener("devicemotion", handleMotion, { passive: true });
-  };
-
-  const stopMotionSensor = () => {
-    if (motionListenerRef.current) {
-      window.removeEventListener("devicemotion", motionListenerRef.current);
-      motionListenerRef.current = null;
-    }
-    currentGRef.current = 0.0;
-    setCurrentG(0.0);
-  };
-
-  // 5. 予備マイク音量取得
-  const startAudioRecording = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      audioStreamRef.current = stream;
-
-      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      audioCtxRef.current = audioCtx;
-      if (audioCtx.state === "suspended") {
-        await audioCtx.resume();
-      }
-
-      const source = audioCtx.createMediaStreamSource(stream);
-      const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 256;
-      source.connect(analyser);
-
-      const bufferLength = analyser.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-
-      audioIntervalRef.current = setInterval(() => {
-        analyser.getByteFrequencyData(dataArray);
-        let sum = 0;
-        for (let i = 0; i < bufferLength; i++) sum += dataArray[i];
-        const avg = Math.round(sum / bufferLength);
-        currentVolRef.current = avg;
-        setCurrentVolume(avg);
-      }, 100);
-    } catch (e) {
-      console.warn("Audio mic failed:", e);
-      currentVolRef.current = 0;
-      setCurrentVolume(0);
-    }
-  };
-
-  const stopAudioRecording = () => {
-    if (audioIntervalRef.current) {
-      clearInterval(audioIntervalRef.current);
-      audioIntervalRef.current = null;
-    }
-    if (audioStreamRef.current) {
-      audioStreamRef.current.getTracks().forEach((track) => track.stop());
-      audioStreamRef.current = null;
-    }
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close();
-      audioCtxRef.current = null;
-    }
-    currentVolRef.current = 0;
-    setCurrentVolume(0);
-  };
-
-  // 6. GPS追従 (全センサー値収集)
-  const startGpsTracking = () => {
-    if (!navigator.geolocation) return;
-
-    watchIdRef.current = navigator.geolocation.watchPosition(
-      (pos) => {
-        const lat = pos.coords.latitude;
-        const lng = pos.coords.longitude;
-        const spd = pos.coords.speed ? Math.max(0, pos.coords.speed * 3.6) : 0;
-        const acc = pos.coords.accuracy || 0;
-        const alt = pos.coords.altitude || 0;
-        const altAcc = pos.coords.altitudeAccuracy || 0;
-        const heading = pos.coords.heading || 0;
-        const gpsTime = pos.timestamp || Date.now();
-
-        setCurrentSpeed(spd);
-        currentSpeedRef.current = spd;
-        setGpsAccuracy(Math.round(acc));
-        setCurrentAltitude(Math.round(alt));
-        currentAltRef.current = alt;
-        currentPosRef.current = { lat, lng };
-
-        if (userMarkerRef.current) userMarkerRef.current.setLatLng([lat, lng]);
-        if (mapRef.current) mapRef.current.panTo([lat, lng], { animate: true });
-
-        let slope = 0;
-        const last = lastRecordedPosRef.current;
-        if (last) {
-          const dM = calcDistanceM(last.lat, last.lng, lat, lng);
-          const dtS = (gpsTime - last.time) / 1000;
-          if (dM < 1.5 && dtS < 0.9) return;
-
-          if (dM >= 2.0) {
-            const dAlt = alt - last.alt;
-            slope = parseFloat(((dAlt / dM) * 100).toFixed(1));
-            setCurrentSlope(slope);
-
-            if (dAlt > 0.5 && altAcc <= 15) {
-              setElevationGain((prev) => prev + dAlt);
-            }
-          }
-
-          if (dM >= 1.5 && acc <= 30) {
-            setTotalDistanceKm((prev) => prev + dM / 1000);
-          }
-        }
-
-        lastRecordedPosRef.current = { lat, lng, alt, time: gpsTime };
-
-        const unphotographed = allBumpsRef.current.filter((b) => !b.photoUrl);
-        let found: BumpPoint | null = null;
-        for (const b of unphotographed) {
-          const d = calcDistanceM(lat, lng, b.lat, b.lng);
-          if (d <= 35) {
-            found = b;
-            break;
-          }
-        }
-        setNearbyBump(found);
-
-        const imu = phoneImuRef.current;
-        const newPoint: TrackPoint = {
-          lat,
-          lng,
-          time: gpsTime,
-          speed: parseFloat(spd.toFixed(1)),
-          impactG: parseFloat(currentGRef.current.toFixed(2)),
-          accuracy: Math.round(acc),
-          altitude: Math.round(alt),
-          altitudeAccuracy: Math.round(altAcc),
-          heading: Math.round(heading),
-          slopePct: slope,
-          volume: currentVolRef.current,
-          phoneAx: parseFloat(imu.ax.toFixed(3)),
-          phoneAy: parseFloat(imu.ay.toFixed(3)),
-          phoneAz: parseFloat(imu.az.toFixed(3)),
-          phoneGx: parseFloat(imu.gx.toFixed(1)),
-          phoneGy: parseFloat(imu.gy.toFixed(1)),
-          phoneGz: parseFloat(imu.gz.toFixed(1)),
-        };
-
-        setCurrentRoute((prev) => [...prev, newPoint]);
-      },
-      (err) => console.error("GPS Watch Error:", err),
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-    );
-  };
-
-  const startSensorsAndTracking = async () => {
-    setIsRecording(true);
-    requestWakeLock();
-    await startAudioRecording();
-    await startMotionSensor();
-    startGpsTracking();
-    if (!timerRef.current) {
-      timerRef.current = setInterval(() => setElapsedSeconds((s) => s + 1), 1000);
-    }
-  };
-
-  const stopSensorsAndTracking = () => {
-    setIsRecording(false);
-    releaseWakeLock();
-    stopMotionSensor();
-    stopAudioRecording();
-    if (watchIdRef.current) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-      watchIdRef.current = null;
-    }
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-    lastRecordedPosRef.current = null;
-    lastBumpPosRef.current = null;
-
-    if (currentRoute.length > 0) {
-      const session: RideSession = {
-        id: `SESS_${formatDateTimeId(Date.now())}`,
-        title: rideTitle,
-        spotName,
-        bikeType,
-        startTime: currentRoute[0]?.time || Date.now(),
-        route: currentRoute,
-        bumps: allBumps.filter((b) => currentRoute.some((r) => Math.abs(r.time - b.timestamp) < 7200000)),
-        distanceKm: totalDistRef.current,
-        elevationGainM: elevationGainRef.current,
-        hasM5Merged: false,
-      };
-      const updated = [session, ...allSessions];
-      saveSessions(updated);
-    }
-  };
-
-  const toggleRecording = async () => {
-    if (!isRecording) {
-      setCurrentRoute([]);
-      setTotalDistanceKm(0);
-      setElevationGain(0);
-      setElapsedSeconds(0);
-      setMaxG(0.0);
-      await startSensorsAndTracking();
-    } else {
-      stopSensorsAndTracking();
-    }
-  };
-
-  // 7. 地図初期化
-  useEffect(() => {
-    const initMap = () => {
-      if (!mapContainerRef.current || mapRef.current) return;
-      const L = (window as any).L;
-      if (!L) return;
-
-      const map = L.map(mapContainerRef.current, {
-        zoomControl: false,
-        attributionControl: false,
-      }).setView([currentPosRef.current.lat, currentPosRef.current.lng], 16);
-
-      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(map);
-
-      sessionRouteLayerRef.current = L.layerGroup().addTo(map);
-      liveRouteLayerRef.current = L.layerGroup().addTo(map);
-      bumpsLayerRef.current = L.layerGroup().addTo(map);
-
-      userMarkerRef.current = L.circleMarker([currentPosRef.current.lat, currentPosRef.current.lng], {
-        radius: 8,
-        color: "#2563eb",
-        fillColor: "#3b82f6",
-        fillOpacity: 1,
-        weight: 3,
-      }).addTo(map);
-
-      mapRef.current = map;
-      drawMap();
-    };
-
-    if (!(window as any).L) {
-      const script = document.createElement("script");
-      script.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
-      script.onload = initMap;
-      document.head.appendChild(script);
-    } else {
-      initMap();
-    }
-  }, []);
-
-  useEffect(() => {
-    if (activeView === "live" && mapRef.current) {
-      setTimeout(() => mapRef.current.invalidateSize(), 100);
-      drawMap();
-    }
-  }, [activeView, selectedSessionId, bumpFilter]);
-
-  const drawMap = () => {
-    if (!mapRef.current) return;
-    const L = (window as any).L;
-    if (!L) return;
-
-    if (sessionRouteLayerRef.current) {
-      sessionRouteLayerRef.current.clearLayers();
-      const targetSession = allSessions.find((s) => s.id === selectedSessionId) || allSessions[0];
-      if (targetSession && targetSession.route.length > 1) {
-        L.polyline(targetSession.route.map((p) => [p.lat, p.lng]), {
-          color: "#06b6d4",
-          weight: 4,
-          opacity: 0.75,
-          dashArray: "6, 6",
-        }).addTo(sessionRouteLayerRef.current);
-      }
-    }
-
-    if (liveRouteLayerRef.current) {
-      liveRouteLayerRef.current.clearLayers();
-      if (currentRoute.length > 1) {
-        L.polyline(currentRoute.map((p) => [p.lat, p.lng]), {
-          color: "#e11d48",
-          weight: 5,
-          opacity: 0.95,
-        }).addTo(liveRouteLayerRef.current);
-      }
-    }
-
-    if (bumpsLayerRef.current) {
-      bumpsLayerRef.current.clearLayers();
-      const filteredBumps = allBumps.filter((b) => {
-        if (bumpFilter === "M5") return b.source === "M5";
-        if (bumpFilter === "PHONE") return b.source === "PHONE";
-        return true;
-      });
-
-      filteredBumps.forEach((bump) => {
-        const hasPhoto = !!bump.photoUrl;
-        const isM5 = bump.source === "M5";
-        const marker = L.circleMarker([bump.lat, bump.lng], {
-          radius: hasPhoto ? 8 : (isM5 ? 12 : 9),
-          color: hasPhoto ? "#059669" : (isM5 ? "#8b5cf6" : "#ffffff"),
-          fillColor: hasPhoto ? "#10b981" : (isM5 ? "#a855f7" : "#f59e0b"),
-          fillOpacity: 0.95,
-          weight: 3,
-        }).addTo(bumpsLayerRef.current);
-
-        const sourceLabel = isM5 ? "【M5高精度検証済】" : "【スマホ予備】";
-        const popupHtml = `
-          <div style="color:#0f172a; font-size:12px; min-width:190px;">
-            <div style="font-weight:bold; color:${isM5 ? '#7c3aed' : '#d97706'};">${sourceLabel}</div>
-            <div><b>ID:</b> <span style="font-family:monospace; font-size:10px;">${bump.id}</span></div>
-            <div><b>衝撃値:</b> ${bump.impactG.toFixed(2)} G</div>
-            <div><b>標高:</b> ${bump.altitude ? bump.altitude + ' m' : '-'}</div>
-            ${
-              hasPhoto
-                ? `
-                  <div style="font-size:10px; color:#475569; word-break:break-all; margin-top:4px;">📁 ${bump.photoFileName}</div>
-                  <img src="${bump.photoUrl}" style="width:100%; border-radius:6px; margin-top:4px;" />
-                `
-                : `
-                  <div style="display:flex; gap:6px; margin-top:8px;">
-                    <button id="btn_photo_${bump.id}" style="flex:2; background:#0284c7; color:#fff; border:none; padding:6px; border-radius:6px; font-weight:bold; cursor:pointer;">📸 撮影</button>
-                    <button id="btn_del_${bump.id}" style="flex:1; background:#ef4444; color:#fff; border:none; padding:6px; border-radius:6px; font-weight:bold; cursor:pointer;">🗑️ 破棄</button>
-                  </div>
-                `
-            }
-          </div>
-        `;
-
-        marker.bindPopup(popupHtml);
-        marker.on("popupopen", () => {
-          const btnPhoto = document.getElementById(`btn_photo_${bump.id}`);
-          if (btnPhoto) btnPhoto.onclick = () => triggerCameraForBump(bump);
-          const btnDel = document.getElementById(`btn_del_${bump.id}`);
-          if (btnDel) btnDel.onclick = () => deleteBump(bump.id);
-        });
-      });
-    }
-  };
-
-  useEffect(() => {
-    drawMap();
-  }, [allBumps, currentRoute, allSessions, selectedSessionId, bumpFilter]);
-
-  const triggerCameraForBump = (bump: BumpPoint) => {
-    setTargetBump(bump);
-    fileInputRef.current?.click();
-  };
-
-  const triggerQuickCapture = () => {
-    if (nearbyBump) {
-      triggerCameraForBump(nearbyBump);
-      return;
-    }
-    const now = Date.now();
-    const newBump: BumpPoint = {
-      id: `BUMP_${formatDateTimeId(now)}`,
-      lat: currentPosRef.current.lat,
-      lng: currentPosRef.current.lng,
-      altitude: currentAltRef.current,
-      impactG: currentGRef.current > 0 ? parseFloat(currentGRef.current.toFixed(2)) : 0.0,
-      timestamp: now,
-      source: "PHONE",
-    };
-    saveBumps([newBump, ...allBumps]);
-    triggerCameraForBump(newBump);
-  };
-
-  const handlePhotoCapture = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !targetBump) return;
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const dataUrl = event.target?.result as string;
-      const dateStr = formatDateTimeId(targetBump.timestamp);
-      const fileName = `IMG_${dateStr}_${targetBump.timestamp}_${targetBump.impactG.toFixed(2)}G_${targetBump.lat.toFixed(5)}_${targetBump.lng.toFixed(5)}.jpg`;
-
-      const a = document.createElement("a");
-      a.href = dataUrl;
-      a.download = fileName;
-      a.click();
-
-      const updated = allBumps.map((b) =>
-        b.id === targetBump.id ? { ...b, photoUrl: dataUrl, photoFileName: fileName } : b
-      );
-      saveBumps(updated);
-
-      setTargetBump(null);
-      setNearbyBump(null);
-    };
-    reader.readAsDataURL(file);
-  };
-
-  const deleteBump = (id: string) => {
-    const updated = allBumps.filter((b) => b.id !== id);
-    saveBumps(updated);
-    if (nearbyBump?.id === id) setNearbyBump(null);
-    if (mapRef.current) mapRef.current.closePopup();
-  };
-
-  // CSVエクスポート（未結合時は空列なし、結合時のみM5統合列付与）
+  // CSVダウンロード
   const downloadSessionCSV = (sess: RideSession) => {
     const isMerged = !!sess.hasM5Merged;
 
@@ -1218,16 +1261,25 @@ export default function CyclingDashboard() {
       {/* サイクルメーター */}
       <div className="bg-slate-900 border-b border-slate-800 p-3 shrink-0 shadow-xl z-20">
         <div className="flex justify-between items-center text-xs pb-1.5 border-b border-slate-800">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
             <span className={`w-2.5 h-2.5 rounded-full ${isRecording ? "bg-red-500 animate-ping" : "bg-cyan-400"}`} />
-            <span className="font-bold text-cyan-400">{isRecording ? "RECORDING" : "STANDBY"}</span>
+            <span className="font-bold text-cyan-400 mr-1.5">{isRecording ? "RECORDING" : "STANDBY"}</span>
+
+            {/* センサー接続インジケーター */}
+            <span className={`px-1 py-0.2 rounded text-[9px] font-mono ${motionStatus === 'OK' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : motionStatus === 'ERR' ? 'bg-rose-950 text-rose-400 border border-rose-800' : 'bg-slate-800 text-slate-500'}`}>
+              G:{motionStatus}
+            </span>
+            <span className={`px-1 py-0.2 rounded text-[9px] font-mono ${micStatus === 'OK' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : micStatus === 'ERR' ? 'bg-rose-950 text-rose-400 border border-rose-800' : 'bg-slate-800 text-slate-500'}`}>
+              MIC:{micStatus}
+            </span>
+            <span className={`px-1 py-0.2 rounded text-[9px] font-mono ${gpsStatus === 'OK' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : gpsStatus === 'ERR' ? 'bg-rose-950 text-rose-400 border border-rose-800' : 'bg-slate-800 text-slate-500'}`}>
+              GPS:{gpsStatus}
+            </span>
           </div>
-          <div className="flex items-center gap-2.5 font-mono text-[11px]">
+
+          <div className="flex items-center gap-2 font-mono text-[11px]">
             <span className="text-slate-400">{formatTime(elapsedSeconds)}</span>
             <span className="text-emerald-400 font-bold">{totalDistanceKm.toFixed(2)} km</span>
-            <span className="text-cyan-400 font-bold flex items-center gap-0.5">
-              <Mountain className="w-3 h-3" /> {currentAltitude}m ({currentSlope > 0 ? `+${currentSlope}` : currentSlope}%)
-            </span>
             <button onClick={handleLogout} className="text-slate-500 hover:text-rose-400 p-1" title="ログアウト">
               <LogOut className="w-3.5 h-3.5" />
             </button>
@@ -1240,6 +1292,9 @@ export default function CyclingDashboard() {
             <div className="flex items-baseline justify-center gap-0.5 font-mono">
               <span className="text-3xl font-black text-cyan-400">{currentSpeed.toFixed(1)}</span>
               <span className="text-[10px] text-slate-500 font-bold">km/h</span>
+            </div>
+            <div className="text-[9px] text-slate-500 font-mono flex items-center justify-center gap-0.5">
+              <Mountain className="w-2.5 h-2.5" /> {currentAltitude}m ({currentSlope > 0 ? `+${currentSlope}` : currentSlope}%)
             </div>
           </div>
           <div className="text-center border-r border-slate-800/80">
@@ -1273,7 +1328,7 @@ export default function CyclingDashboard() {
             }`}
           >
             {isRecording ? <Square className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
-            {isRecording ? "計測停止 (保存)" : "計測スタート"}
+            {isRecording ? "計測停止 (保存)" : "計測スタート (センサー許可)"}
           </button>
 
           <button
@@ -1314,7 +1369,6 @@ export default function CyclingDashboard() {
         
         {/* ビュー 1: ライブマップ */}
         <div className={`w-full h-full relative ${activeView === "live" ? "block" : "hidden"}`}>
-          
           <div className="absolute top-2 left-2 right-2 z-[400] flex flex-col gap-1.5 pointer-events-none">
             <div className="bg-slate-950/85 backdrop-blur-md px-3 py-1.5 rounded-xl border border-slate-800 flex justify-between items-center text-[11px] pointer-events-auto shadow-md">
               <div className="flex gap-2.5">
