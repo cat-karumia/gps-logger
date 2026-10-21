@@ -16,10 +16,6 @@ import {
   History,
   Image as ImageIcon,
   FileText,
-  Edit2,
-  Check,
-  ChevronDown,
-  ChevronUp,
   RefreshCw,
   Database,
   Mic,
@@ -29,7 +25,8 @@ import {
   Lock,
   LogOut,
   Filter,
-  Activity
+  Activity,
+  Compass
 } from "lucide-react";
 
 const GOOGLE_API_KEY = "AIzaSyAYislWzcpW08gA9kDP19jL72UF0E_1h6Y";
@@ -50,14 +47,12 @@ interface TrackPoint {
   heading: number;
   slopePct: number;
   volume: number;
-  // スマホ生IMU
   phoneAx: number;
   phoneAy: number;
   phoneAz: number;
   phoneGx: number;
   phoneGy: number;
   phoneGz: number;
-  // M5突合データ
   m5Ax?: number;
   m5Ay?: number;
   m5Az?: number;
@@ -120,27 +115,31 @@ export default function CyclingDashboard() {
   const [passwordInput, setPasswordInput] = useState<string>("");
   const [authError, setAuthError] = useState<string | null>(null);
 
-  const [activeView, setActiveView] = useState<"live" | "photos" | "sessions" | "drive" | "meta">("live");
+  // タブ: live(マップ), computer(サイコン), photos(写真&段差), sessions(履歴), drive(Drive同期), meta(設定)
+  const [activeView, setActiveView] = useState<"live" | "computer" | "photos" | "sessions" | "drive" | "meta">("live");
   const [isRecording, setIsRecording] = useState(false);
 
-  // センサー動作インジケーター
+  // センサー状態
   const [motionStatus, setMotionStatus] = useState<"STANDBY" | "OK" | "ERR">("STANDBY");
   const [micStatus, setMicStatus] = useState<"STANDBY" | "OK" | "ERR">("STANDBY");
   const [gpsStatus, setGpsStatus] = useState<"STANDBY" | "OK" | "ERR">("STANDBY");
 
   // リアルタイム指標
   const [currentSpeed, setCurrentSpeed] = useState(0);
+  const [maxSpeed, setMaxSpeed] = useState(0);
+  const [avgSpeed, setAvgSpeed] = useState(0);
   const [currentG, setCurrentG] = useState(0.0);
   const [maxG, setMaxG] = useState(0.0);
   const [currentAltitude, setCurrentAltitude] = useState(0);
   const [currentSlope, setCurrentSlope] = useState(0);
   const [currentVolume, setCurrentVolume] = useState(0);
   const [gpsAccuracy, setGpsAccuracy] = useState(0);
+  const [headingDeg, setHeadingDeg] = useState(0);
   const [totalDistanceKm, setTotalDistanceKm] = useState(0);
   const [elevationGain, setElevationGain] = useState(0);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
-  // フィルタ状態
+  // 段差フィルター
   const [bumpFilter, setBumpFilter] = useState<"ALL" | "M5" | "PHONE">("ALL");
 
   // メタデータ
@@ -215,7 +214,6 @@ export default function CyclingDashboard() {
     return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
   };
 
-  // 1. 初期化・認証確認
   useEffect(() => {
     const storedAuth = localStorage.getItem("velo_auth_token");
     if (storedAuth === AUTH_PASSWORD_HASH) {
@@ -287,7 +285,7 @@ export default function CyclingDashboard() {
     localStorage.setItem("velo_sessions_history", JSON.stringify(sessions));
   };
 
-  // 2. 地図初期化（認証後・コンテナ出現時に確実にバインド）
+  // 地図初期化
   const initMap = () => {
     if (!mapContainerRef.current || mapRef.current) return;
     const L = (window as any).L;
@@ -323,7 +321,6 @@ export default function CyclingDashboard() {
   useEffect(() => {
     if (!isAuthenticated) return;
 
-    // Leaflet CSS を動的に保証
     if (!document.getElementById("leaflet-css")) {
       const link = document.createElement("link");
       link.id = "leaflet-css";
@@ -335,9 +332,7 @@ export default function CyclingDashboard() {
     if (!(window as any).L) {
       const script = document.createElement("script");
       script.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
-      script.onload = () => {
-        setTimeout(initMap, 50);
-      };
+      script.onload = () => setTimeout(initMap, 50);
       document.head.appendChild(script);
     } else {
       setTimeout(initMap, 50);
@@ -435,13 +430,8 @@ export default function CyclingDashboard() {
     }
   };
 
-  useEffect(() => {
-    drawMap();
-  }, [allBumps, currentRoute, allSessions, selectedSessionId, bumpFilter]);
-
-  // 3. モーションセンサー開始（iOS Safari最優先同期実行）
+  // モーションセンサー直接要求
   const startMotionSensorDirectly = async (): Promise<boolean> => {
-    // iOS 13+ Safariの permission 要求
     if (typeof (DeviceMotionEvent as any) !== "undefined" && typeof (DeviceMotionEvent as any).requestPermission === "function") {
       try {
         const permissionState = await (DeviceMotionEvent as any).requestPermission();
@@ -466,7 +456,6 @@ export default function CyclingDashboard() {
 
       const pureAcc = e.acceleration;
       const rawAcc = e.accelerationIncludingGravity;
-
       let rawDynamicG = 0.0;
 
       if (pureAcc && pureAcc.x !== null && pureAcc.y !== null && pureAcc.z !== null) {
@@ -498,7 +487,6 @@ export default function CyclingDashboard() {
       setCurrentG(smoothedG);
       setMaxG((prev) => Math.max(prev, smoothedG));
 
-      // 停止中・歩行未満（3.0 km/h 未満）は段差検知をミュート
       if (currentSpeedRef.current < 3.0) return;
 
       const now = Date.now();
@@ -555,7 +543,7 @@ export default function CyclingDashboard() {
     setMotionStatus("STANDBY");
   };
 
-  // 4. マイク音量取得
+  // マイク音量取得
   const startAudioRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -611,7 +599,7 @@ export default function CyclingDashboard() {
     setMicStatus("STANDBY");
   };
 
-  // 5. GPS追従
+  // GPS追従
   const startGpsTracking = () => {
     if (!navigator.geolocation) {
       setGpsStatus("ERR");
@@ -632,9 +620,11 @@ export default function CyclingDashboard() {
 
         setCurrentSpeed(spd);
         currentSpeedRef.current = spd;
+        setMaxSpeed((prev) => Math.max(prev, spd));
         setGpsAccuracy(Math.round(acc));
         setCurrentAltitude(Math.round(alt));
         currentAltRef.current = alt;
+        setHeadingDeg(Math.round(heading));
         currentPosRef.current = { lat, lng };
 
         if (userMarkerRef.current) userMarkerRef.current.setLatLng([lat, lng]);
@@ -696,7 +686,14 @@ export default function CyclingDashboard() {
           phoneGz: parseFloat(imu.gz.toFixed(1)),
         };
 
-        setCurrentRoute((prev) => [...prev, newPoint]);
+        setCurrentRoute((prev) => {
+          const next = [...prev, newPoint];
+          const speeds = next.map((p) => p.speed).filter((s) => s > 0);
+          if (speeds.length > 0) {
+            setAvgSpeed(speeds.reduce((a, b) => a + b, 0) / speeds.length);
+          }
+          return next;
+        });
       },
       (err) => {
         console.error("GPS Watch Error:", err);
@@ -706,18 +703,15 @@ export default function CyclingDashboard() {
     );
   };
 
-  // 計測スタート処理（ボタンタップ直後にモーションセンサー許可を同期発火！）
   const startSensorsAndTracking = async () => {
     setIsRecording(true);
     requestWakeLock();
 
-    // ★iOS Safariの最重要点: ユーザーのタップ直後に一切のawaitを挟まず呼ぶ！
     const motionOk = await startMotionSensorDirectly();
     if (!motionOk) {
-      alert("【iOS Safari 注意】\nモーションセンサーへのアクセスが許可されませんでした。\n設定アプリ > Safari > モーションと方向のアクセス をオンにしてください。");
+      alert("【iOS Safari 注意】\n設定アプリ > Safari > モーションと方向のアクセス をオンにしてください。");
     }
 
-    // 次にマイクとGPS
     await startAudioRecording();
     startGpsTracking();
 
@@ -767,6 +761,8 @@ export default function CyclingDashboard() {
       setElevationGain(0);
       setElapsedSeconds(0);
       setMaxG(0.0);
+      setMaxSpeed(0);
+      setAvgSpeed(0);
       await startSensorsAndTracking();
     } else {
       stopSensorsAndTracking();
@@ -1258,92 +1254,51 @@ export default function CyclingDashboard() {
         className="hidden"
       />
 
-      {/* サイクルメーター */}
-      <div className="bg-slate-900 border-b border-slate-800 p-3 shrink-0 shadow-xl z-20">
-        <div className="flex justify-between items-center text-xs pb-1.5 border-b border-slate-800">
+      {/* トップステータスバー */}
+      <div className="bg-slate-900 border-b border-slate-800 p-2.5 shrink-0 shadow-lg z-20">
+        <div className="flex justify-between items-center text-xs pb-1 border-b border-slate-800">
           <div className="flex items-center gap-1.5">
-            <span className={`w-2.5 h-2.5 rounded-full ${isRecording ? "bg-red-500 animate-ping" : "bg-cyan-400"}`} />
-            <span className="font-bold text-cyan-400 mr-1.5">{isRecording ? "RECORDING" : "STANDBY"}</span>
-
-            {/* センサー接続インジケーター */}
-            <span className={`px-1 py-0.2 rounded text-[9px] font-mono ${motionStatus === 'OK' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : motionStatus === 'ERR' ? 'bg-rose-950 text-rose-400 border border-rose-800' : 'bg-slate-800 text-slate-500'}`}>
-              G:{motionStatus}
-            </span>
-            <span className={`px-1 py-0.2 rounded text-[9px] font-mono ${micStatus === 'OK' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : micStatus === 'ERR' ? 'bg-rose-950 text-rose-400 border border-rose-800' : 'bg-slate-800 text-slate-500'}`}>
-              MIC:{micStatus}
-            </span>
-            <span className={`px-1 py-0.2 rounded text-[9px] font-mono ${gpsStatus === 'OK' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : gpsStatus === 'ERR' ? 'bg-rose-950 text-rose-400 border border-rose-800' : 'bg-slate-800 text-slate-500'}`}>
-              GPS:{gpsStatus}
-            </span>
+            <span className={`w-2 h-2 rounded-full ${isRecording ? "bg-red-500 animate-ping" : "bg-cyan-400"}`} />
+            <span className="font-bold text-cyan-400 mr-1">{isRecording ? "REC" : "STANDBY"}</span>
+            <span className={`px-1 py-0.2 rounded text-[8px] font-mono ${motionStatus === 'OK' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-slate-800 text-slate-500'}`}>G:{motionStatus}</span>
+            <span className={`px-1 py-0.2 rounded text-[8px] font-mono ${micStatus === 'OK' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-slate-800 text-slate-500'}`}>MIC:{micStatus}</span>
+            <span className={`px-1 py-0.2 rounded text-[8px] font-mono ${gpsStatus === 'OK' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-slate-800 text-slate-500'}`}>GPS:{gpsStatus}</span>
           </div>
 
           <div className="flex items-center gap-2 font-mono text-[11px]">
             <span className="text-slate-400">{formatTime(elapsedSeconds)}</span>
             <span className="text-emerald-400 font-bold">{totalDistanceKm.toFixed(2)} km</span>
-            <button onClick={handleLogout} className="text-slate-500 hover:text-rose-400 p-1" title="ログアウト">
+            <button onClick={handleLogout} className="text-slate-500 hover:text-rose-400 p-1">
               <LogOut className="w-3.5 h-3.5" />
             </button>
           </div>
         </div>
 
-        <div className="grid grid-cols-3 gap-1.5 items-center py-2">
-          <div className="text-center border-r border-slate-800/80">
-            <div className="text-[9px] text-slate-400 font-bold tracking-wider">SPEED</div>
-            <div className="flex items-baseline justify-center gap-0.5 font-mono">
-              <span className="text-3xl font-black text-cyan-400">{currentSpeed.toFixed(1)}</span>
-              <span className="text-[10px] text-slate-500 font-bold">km/h</span>
-            </div>
-            <div className="text-[9px] text-slate-500 font-mono flex items-center justify-center gap-0.5">
-              <Mountain className="w-2.5 h-2.5" /> {currentAltitude}m ({currentSlope > 0 ? `+${currentSlope}` : currentSlope}%)
-            </div>
-          </div>
-          <div className="text-center border-r border-slate-800/80">
-            <div className="text-[9px] text-slate-400 font-bold tracking-wider">SMOOTH G</div>
-            <div className="flex items-baseline justify-center gap-0.5 font-mono">
-              <span className={`text-3xl font-black ${currentG >= thresholdG ? "text-amber-400 animate-bounce" : "text-slate-200"}`}>
-                {currentG.toFixed(2)}
-              </span>
-              <span className="text-[10px] text-slate-500 font-bold">G</span>
-            </div>
-            <div className="text-[9px] text-slate-500">MAX: {maxG.toFixed(2)}G</div>
-          </div>
-          <div className="text-center">
-            <div className="text-[9px] text-slate-400 font-bold tracking-wider flex items-center justify-center gap-1">
-              <Mic className="w-2.5 h-2.5 text-cyan-400" /> MIC VOL
-            </div>
-            <div className="flex items-baseline justify-center gap-0.5 font-mono">
-              <span className="text-3xl font-black text-emerald-400">{currentVolume}</span>
-            </div>
-            <div className="text-[9px] text-slate-500 font-mono">RMS LEVEL</div>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2 pt-1">
+        {/* コントロールボタン群 */}
+        <div className="flex items-center gap-2 pt-1.5">
           <button
             onClick={toggleRecording}
-            className={`flex-1 py-2.5 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 transition-transform active:scale-95 ${
-              isRecording 
-                ? "bg-rose-600 hover:bg-rose-500 text-white animate-pulse" 
-                : "bg-emerald-500 hover:bg-emerald-400 text-slate-950"
+            className={`flex-1 py-2 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 transition-transform active:scale-95 ${
+              isRecording ? "bg-rose-600 hover:bg-rose-500 text-white animate-pulse" : "bg-emerald-500 hover:bg-emerald-400 text-slate-950"
             }`}
           >
-            {isRecording ? <Square className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
+            {isRecording ? <Square className="w-3.5 h-3.5 fill-current" /> : <Play className="w-3.5 h-3.5 fill-current" />}
             {isRecording ? "計測停止 (保存)" : "計測スタート (センサー許可)"}
           </button>
 
           <button
             onClick={triggerQuickCapture}
-            className="px-3.5 py-2.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl font-bold text-xs flex items-center gap-1.5 active:scale-95 shadow-lg"
+            className="px-3 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl font-bold text-xs flex items-center gap-1 active:scale-95 shadow-md"
           >
-            <Camera className="w-4 h-4" />
+            <Camera className="w-3.5 h-3.5" />
             <span>段差撮影</span>
           </button>
 
           <button
             onClick={() => setShowSettings(!showSettings)}
-            className="p-2.5 rounded-xl bg-slate-800 border border-slate-700 text-slate-300"
+            className="p-2 rounded-xl bg-slate-800 border border-slate-700 text-slate-300"
           >
-            <Sliders className="w-4 h-4" />
+            <Sliders className="w-3.5 h-3.5" />
           </button>
         </div>
 
@@ -1367,59 +1322,33 @@ export default function CyclingDashboard() {
       {/* メインビュー */}
       <div className="flex-1 relative overflow-hidden bg-slate-950">
         
-        {/* ビュー 1: ライブマップ */}
+        {/* ビュー 1: ライブマップ (全画面すっきり表示) */}
         <div className={`w-full h-full relative ${activeView === "live" ? "block" : "hidden"}`}>
-          <div className="absolute top-2 left-2 right-2 z-[400] flex flex-col gap-1.5 pointer-events-none">
-            <div className="bg-slate-950/85 backdrop-blur-md px-3 py-1.5 rounded-xl border border-slate-800 flex justify-between items-center text-[11px] pointer-events-auto shadow-md">
-              <div className="flex gap-2.5">
-                <span className="flex items-center gap-1 text-cyan-400 font-bold">
-                  <span className="w-2 h-2 rounded-full bg-cyan-400" />
-                  選択軌跡: {allSessions.find((s) => s.id === selectedSessionId)?.route.length || 0}点
-                </span>
-                <span className="flex items-center gap-1 text-rose-400 font-bold">
-                  <span className="w-2 h-2 rounded-full bg-rose-500" />
-                  現在走行: {currentRoute.length}点
-                </span>
-              </div>
-              {allSessions.length > 0 && (
-                <select
-                  value={selectedSessionId || ""}
-                  onChange={(e) => setSelectedSessionId(e.target.value)}
-                  className="bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-[10px] text-slate-300 outline-none"
-                >
-                  <option value="">最新セッション</option>
-                  {allSessions.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.title} ({s.distanceKm.toFixed(1)}km) {s.hasM5Merged ? "★M5" : ""}
-                    </option>
-                  ))}
-                </select>
-              )}
+          <div className="absolute top-2 left-2 right-2 z-[400] flex justify-between items-center text-[11px] pointer-events-none">
+            <div className="bg-slate-950/85 backdrop-blur-md px-3 py-1.5 rounded-xl border border-slate-800 flex gap-2.5 pointer-events-auto shadow-md">
+              <span className="flex items-center gap-1 text-cyan-400 font-bold">
+                <span className="w-2 h-2 rounded-full bg-cyan-400" />
+                選択: {allSessions.find((s) => s.id === selectedSessionId)?.route.length || 0}点
+              </span>
+              <span className="flex items-center gap-1 text-rose-400 font-bold">
+                <span className="w-2 h-2 rounded-full bg-rose-500" />
+                現在: {currentRoute.length}点
+              </span>
             </div>
-
-            {/* 段差フィルタ切替バー */}
-            <div className="self-start bg-slate-950/90 backdrop-blur-md p-1 rounded-xl border border-slate-800 flex gap-1 pointer-events-auto text-[10px] font-bold shadow-md">
-              <button
-                onClick={() => setBumpFilter("ALL")}
-                className={`px-2.5 py-1 rounded-lg transition-all ${bumpFilter === "ALL" ? "bg-slate-800 text-cyan-300 shadow" : "text-slate-400"}`}
+            {allSessions.length > 0 && (
+              <select
+                value={selectedSessionId || ""}
+                onChange={(e) => setSelectedSessionId(e.target.value)}
+                className="bg-slate-900 border border-slate-700 rounded-xl px-2 py-1 text-[10px] text-slate-300 outline-none pointer-events-auto shadow-md"
               >
-                全段差 ({allBumps.length})
-              </button>
-              <button
-                onClick={() => setBumpFilter("M5")}
-                className={`px-2.5 py-1 rounded-lg transition-all flex items-center gap-1 ${bumpFilter === "M5" ? "bg-purple-900 text-purple-200 shadow" : "text-slate-400"}`}
-              >
-                <span className="w-1.5 h-1.5 rounded-full bg-purple-400" />
-                M5検証のみ ({allBumps.filter((b) => b.source === "M5").length})
-              </button>
-              <button
-                onClick={() => setBumpFilter("PHONE")}
-                className={`px-2.5 py-1 rounded-lg transition-all flex items-center gap-1 ${bumpFilter === "PHONE" ? "bg-amber-950 text-amber-200 shadow" : "text-slate-400"}`}
-              >
-                <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
-                スマホ予備 ({allBumps.filter((b) => b.source === "PHONE").length})
-              </button>
-            </div>
+                <option value="">最新セッション</option>
+                {allSessions.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.title} ({s.distanceKm.toFixed(1)}km) {s.hasM5Merged ? "★M5" : ""}
+                  </option>
+                ))}
+              </select>
+            )}
           </div>
 
           <div ref={mapContainerRef} className="w-full h-full" />
@@ -1453,12 +1382,117 @@ export default function CyclingDashboard() {
           )}
         </div>
 
-        {/* ビュー 2: 未撮影 ＆ 写真 */}
+        {/* ビュー 2: サイコン専用ダッシュボード (高視認性フルメーター) */}
+        {activeView === "computer" && (
+          <div className="h-full overflow-y-auto p-3 space-y-3 font-mono">
+            {/* 速度特大表示 */}
+            <div className="bg-slate-900 border border-slate-800 rounded-3xl p-4 text-center shadow-lg relative overflow-hidden">
+              <div className="text-[10px] text-slate-400 font-bold tracking-widest uppercase">CURRENT SPEED</div>
+              <div className="flex items-baseline justify-center gap-1 py-1">
+                <span className="text-7xl font-black text-cyan-400 tracking-tight">{currentSpeed.toFixed(1)}</span>
+                <span className="text-sm font-bold text-slate-500">km/h</span>
+              </div>
+              <div className="grid grid-cols-2 gap-2 pt-2 border-t border-slate-800/80 text-xs">
+                <div>
+                  <span className="text-slate-500 text-[10px] block">MAX SPEED</span>
+                  <span className="text-slate-200 font-bold">{maxSpeed.toFixed(1)} km/h</span>
+                </div>
+                <div>
+                  <span className="text-slate-500 text-[10px] block">AVG SPEED</span>
+                  <span className="text-slate-200 font-bold">{avgSpeed.toFixed(1)} km/h</span>
+                </div>
+              </div>
+            </div>
+
+            {/* 高度・斜度・方角 */}
+            <div className="grid grid-cols-3 gap-2">
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3 text-center">
+                <span className="text-[9px] text-slate-500 block">ALTITUDE</span>
+                <span className="text-xl font-black text-emerald-400">{currentAltitude}</span>
+                <span className="text-[9px] text-slate-500 block">m</span>
+              </div>
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3 text-center">
+                <span className="text-[9px] text-slate-500 block">SLOPE</span>
+                <span className={`text-xl font-black ${currentSlope > 0 ? "text-rose-400" : currentSlope < 0 ? "text-cyan-400" : "text-slate-300"}`}>
+                  {currentSlope > 0 ? `+${currentSlope}` : currentSlope}%
+                </span>
+                <span className="text-[9px] text-slate-500 block">GRADE</span>
+              </div>
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3 text-center">
+                <span className="text-[9px] text-slate-500 block">HEADING</span>
+                <span className="text-xl font-black text-amber-400">{headingDeg}°</span>
+                <span className="text-[9px] text-slate-500 block">DIR</span>
+              </div>
+            </div>
+
+            {/* 衝撃G ＆ マイクレベル */}
+            <div className="grid grid-cols-2 gap-2">
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3 text-center">
+                <span className="text-[9px] text-slate-500 block">PHONE SMOOTH G</span>
+                <span className={`text-3xl font-black ${currentG >= thresholdG ? "text-amber-400 animate-bounce" : "text-slate-200"}`}>
+                  {currentG.toFixed(2)}
+                </span>
+                <span className="text-[9px] text-slate-500 block">MAX: {maxG.toFixed(2)}G</span>
+              </div>
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3 text-center">
+                <span className="text-[9px] text-slate-500 block">MIC VOLUME</span>
+                <span className="text-3xl font-black text-cyan-400">{currentVolume}</span>
+                <span className="text-[9px] text-slate-500 block">RMS LEVEL</span>
+              </div>
+            </div>
+
+            {/* 生センサー6軸リアルタイムモニタ */}
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3 text-xs space-y-1 text-slate-400">
+              <div className="text-[10px] text-slate-500 font-bold mb-1 flex items-center justify-between">
+                <span>IMU RAW STREAM</span>
+                <span className="text-cyan-400">GPS ACC: ±{gpsAccuracy}m</span>
+              </div>
+              <div className="flex justify-between font-mono text-[10px]">
+                <span>ACC [G]</span>
+                <span className="text-slate-200">X:{phoneImuRef.current.ax.toFixed(2)} Y:{phoneImuRef.current.ay.toFixed(2)} Z:{phoneImuRef.current.az.toFixed(2)}</span>
+              </div>
+              <div className="flex justify-between font-mono text-[10px]">
+                <span>GYR [dps]</span>
+                <span className="text-slate-200">X:{phoneImuRef.current.gx.toFixed(1)} Y:{phoneImuRef.current.gy.toFixed(1)} Z:{phoneImuRef.current.gz.toFixed(1)}</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ビュー 3: 写真 ＆ 段差一覧 (段差フィルターをここに集約！) */}
         {activeView === "photos" && (
           <div className="h-full overflow-y-auto p-3 space-y-4">
+            
+            {/* 段差フィルター切替バー */}
+            <div className="bg-slate-900 border border-slate-800 p-2 rounded-2xl flex items-center justify-between text-xs">
+              <span className="text-slate-400 font-bold flex items-center gap-1 text-[11px]">
+                <Filter className="w-3.5 h-3.5 text-cyan-400" /> 表示形式:
+              </span>
+              <div className="flex gap-1 text-[10px] font-bold">
+                <button
+                  onClick={() => setBumpFilter("ALL")}
+                  className={`px-2.5 py-1 rounded-lg transition-all ${bumpFilter === "ALL" ? "bg-cyan-600 text-white" : "bg-slate-950 text-slate-400"}`}
+                >
+                  全段差 ({allBumps.length})
+                </button>
+                <button
+                  onClick={() => setBumpFilter("M5")}
+                  className={`px-2.5 py-1 rounded-lg transition-all ${bumpFilter === "M5" ? "bg-purple-900 text-purple-200" : "bg-slate-950 text-slate-400"}`}
+                >
+                  M5のみ ({allBumps.filter((b) => b.source === "M5").length})
+                </button>
+                <button
+                  onClick={() => setBumpFilter("PHONE")}
+                  className={`px-2.5 py-1 rounded-lg transition-all ${bumpFilter === "PHONE" ? "bg-amber-950 text-amber-200" : "bg-slate-950 text-slate-400"}`}
+                >
+                  スマホ予備 ({allBumps.filter((b) => b.source === "PHONE").length})
+                </button>
+              </div>
+            </div>
+
             <div className="flex justify-between items-center">
               <h3 className="text-xs font-bold text-amber-400 uppercase tracking-wider flex items-center gap-1.5">
-                <AlertTriangle className="w-4 h-4" /> 撮影待ち段差 ({unphotographedBumps.length}地点)
+                <AlertTriangle className="w-4 h-4" /> 撮影待ち段差 ({unphotographedBumps.filter(b => bumpFilter === "ALL" ? true : b.source === bumpFilter).length}地点)
               </h3>
               {allBumps.length > 0 && (
                 <button
@@ -1470,40 +1504,42 @@ export default function CyclingDashboard() {
               )}
             </div>
 
-            {unphotographedBumps.length === 0 ? (
+            {unphotographedBumps.filter(b => bumpFilter === "ALL" ? true : b.source === bumpFilter).length === 0 ? (
               <div className="text-xs text-slate-500 bg-slate-900 border border-slate-800 p-3 rounded-xl text-center">
-                未撮影の段差はありません
+                該当する未撮影の段差はありません
               </div>
             ) : (
               <div className="space-y-1.5 max-h-56 overflow-y-auto">
-                {unphotographedBumps.map((b) => (
-                  <div key={b.id} className="p-2.5 bg-slate-900 border border-slate-800 rounded-xl flex items-center justify-between text-xs">
-                    <div>
-                      <div className="font-mono text-cyan-300 font-bold flex items-center gap-1.5">
-                        <span>{b.impactG.toFixed(2)}G</span>
-                        <span className={`text-[9px] px-1.5 py-0.2 rounded ${b.source === "M5" ? "bg-purple-900 text-purple-300" : "bg-slate-800 text-slate-400"}`}>
-                          {b.source === "M5" ? "M5Stack" : "Phone"}
-                        </span>
-                        {b.altitude ? <span className="text-[10px] text-slate-500 font-mono">{b.altitude}m</span> : null}
+                {unphotographedBumps
+                  .filter(b => bumpFilter === "ALL" ? true : b.source === bumpFilter)
+                  .map((b) => (
+                    <div key={b.id} className="p-2.5 bg-slate-900 border border-slate-800 rounded-xl flex items-center justify-between text-xs">
+                      <div>
+                        <div className="font-mono text-cyan-300 font-bold flex items-center gap-1.5">
+                          <span>{b.impactG.toFixed(2)}G</span>
+                          <span className={`text-[9px] px-1.5 py-0.2 rounded ${b.source === "M5" ? "bg-purple-900 text-purple-300" : "bg-slate-800 text-slate-400"}`}>
+                            {b.source === "M5" ? "M5Stack" : "Phone"}
+                          </span>
+                          {b.altitude ? <span className="text-[10px] text-slate-500 font-mono">{b.altitude}m</span> : null}
+                        </div>
+                        <div className="text-[10px] text-slate-400">{b.timestamp > 0 ? new Date(b.timestamp).toLocaleTimeString() : "-"} ({b.lat.toFixed(4)}, {b.lng.toFixed(4)})</div>
                       </div>
-                      <div className="text-[10px] text-slate-400">{b.timestamp > 0 ? new Date(b.timestamp).toLocaleTimeString() : "-"} ({b.lat.toFixed(4)}, {b.lng.toFixed(4)})</div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => triggerCameraForBump(b)}
+                          className="px-2.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-xs font-bold flex items-center gap-1"
+                        >
+                          <Camera className="w-3.5 h-3.5" /> 撮影
+                        </button>
+                        <button
+                          onClick={() => deleteBump(b.id)}
+                          className="p-1.5 bg-red-950 text-red-400 rounded-lg hover:bg-red-900"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => triggerCameraForBump(b)}
-                        className="px-2.5 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-xs font-bold flex items-center gap-1"
-                      >
-                        <Camera className="w-3.5 h-3.5" /> 撮影
-                      </button>
-                      <button
-                        onClick={() => deleteBump(b.id)}
-                        className="p-1.5 bg-red-950 text-red-400 rounded-lg hover:bg-red-900"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  </div>
-                ))}
+                  ))}
               </div>
             )}
 
@@ -1530,7 +1566,6 @@ export default function CyclingDashboard() {
                       <button
                         onClick={() => deleteBump(bump.id)}
                         className="absolute top-1 right-1 p-1 bg-slate-950/80 text-red-400 rounded-md"
-                        title="削除"
                       >
                         <Trash2 className="w-3 h-3" />
                       </button>
@@ -1542,7 +1577,7 @@ export default function CyclingDashboard() {
           </div>
         )}
 
-        {/* ビュー 3: セッション履歴 */}
+        {/* ビュー 4: セッション履歴 */}
         {activeView === "sessions" && (
           <div className="h-full overflow-y-auto p-3 space-y-3">
             <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5 pt-1">
@@ -1550,7 +1585,7 @@ export default function CyclingDashboard() {
             </h3>
             {allSessions.length === 0 ? (
               <div className="text-xs text-slate-500 text-center py-10 bg-slate-900 border border-slate-800 rounded-xl">
-                走行セッションがありません。「Drive同期」タブから取り込むか、走行計測を完了してください。
+                走行セッションがありません。計測を完了すると保存されます。
               </div>
             ) : (
               <div className="space-y-2.5">
@@ -1620,7 +1655,7 @@ export default function CyclingDashboard() {
           </div>
         )}
 
-        {/* ビュー 4: Google Drive マルチ同期管理 */}
+        {/* ビュー 5: Google Drive マルチ同期管理 */}
         {activeView === "drive" && (
           <div className="h-full overflow-y-auto p-3 space-y-3">
             <div className="bg-slate-900 border border-cyan-800/60 rounded-2xl p-3 shadow-lg space-y-3">
@@ -1700,7 +1735,7 @@ export default function CyclingDashboard() {
           </div>
         )}
 
-        {/* ビュー 5: 設定 */}
+        {/* ビュー 6: 設定 */}
         {activeView === "meta" && (
           <div className="h-full overflow-y-auto p-4 space-y-4">
             <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
@@ -1740,29 +1775,37 @@ export default function CyclingDashboard() {
 
       </div>
 
-      {/* タブバー */}
-      <nav className="h-12 bg-slate-900 border-t border-slate-800 grid grid-cols-5 shrink-0 text-[10px]">
+      {/* タブバー (サイコンタブを追加した全6タブ構成) */}
+      <nav className="h-12 bg-slate-900 border-t border-slate-800 grid grid-cols-6 shrink-0 text-[10px]">
         <button
           onClick={() => setActiveView("live")}
           className={`flex flex-col items-center justify-center gap-0.5 ${activeView === "live" ? "text-cyan-400 font-bold" : "text-slate-500"}`}
         >
-          <MapPin className="w-4 h-4" />
+          <MapPin className="w-3.5 h-3.5" />
           <span>マップ</span>
+        </button>
+
+        <button
+          onClick={() => setActiveView("computer")}
+          className={`flex flex-col items-center justify-center gap-0.5 ${activeView === "computer" ? "text-cyan-400 font-bold" : "text-slate-500"}`}
+        >
+          <Gauge className="w-3.5 h-3.5" />
+          <span>サイコン</span>
         </button>
 
         <button
           onClick={() => setActiveView("photos")}
           className={`flex flex-col items-center justify-center gap-0.5 ${activeView === "photos" ? "text-cyan-400 font-bold" : "text-slate-500"}`}
         >
-          <ImageIcon className="w-4 h-4" />
-          <span>写真</span>
+          <ImageIcon className="w-3.5 h-3.5" />
+          <span>段差/写真</span>
         </button>
 
         <button
           onClick={() => setActiveView("sessions")}
           className={`flex flex-col items-center justify-center gap-0.5 ${activeView === "sessions" ? "text-cyan-400 font-bold" : "text-slate-500"}`}
         >
-          <History className="w-4 h-4" />
+          <History className="w-3.5 h-3.5" />
           <span>履歴</span>
         </button>
 
@@ -1773,15 +1816,15 @@ export default function CyclingDashboard() {
           }}
           className={`flex flex-col items-center justify-center gap-0.5 ${activeView === "drive" ? "text-cyan-400 font-bold" : "text-slate-500"}`}
         >
-          <Database className="w-4 h-4" />
-          <span>Drive同期</span>
+          <Database className="w-3.5 h-3.5" />
+          <span>同期</span>
         </button>
 
         <button
           onClick={() => setActiveView("meta")}
           className={`flex flex-col items-center justify-center gap-0.5 ${activeView === "meta" ? "text-cyan-400 font-bold" : "text-slate-500"}`}
         >
-          <FileText className="w-4 h-4" />
+          <FileText className="w-3.5 h-3.5" />
           <span>設定</span>
         </button>
       </nav>
